@@ -354,7 +354,7 @@ def test_running_profile_has_cdp_url(app_client: TestClient):
     resp = app_client.get(f"/api/profiles/{pid}")
     data = resp.json()
     assert data["status"] == "running"
-    assert data["cdp_url"] == f"http://localhost/api/profiles/{pid}/cdp"
+    assert data["cdp_url"] == f"/api/profiles/{pid}/cdp"
 
     # Cleanup
     main.browser_mgr.running.pop(pid, None)

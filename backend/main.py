@@ -675,7 +675,8 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
         await websocket.close(code=4004, reason="Profile not running")
         return
 
-    await websocket.close(code=4004, reason="VNC not available")
+    await websocket.accept()
+    await websocket.close(code=4006, reason="VNC not available")
 
 
 # ── CDP WebSocket Proxy ──────────────────────────────────────────────────────

@@ -111,5 +111,5 @@ def test_get_status_running():
     status = mgr.get_status("abc")
     assert status == {
         "status": "running",
-        "cdp_url": "http://localhost/api/profiles/abc/cdp",
+        "cdp_url": "/api/profiles/abc/cdp",
     }

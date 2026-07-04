@@ -294,7 +294,7 @@ class BrowserManager:
         if running:
             return {
                 "status": "running",
-                "cdp_url": f"http://localhost/api/profiles/{profile_id}/cdp",
+                "cdp_url": f"/api/profiles/{profile_id}/cdp",
             }
         return {"status": "stopped", "cdp_url": None}
 
