@@ -4,14 +4,26 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import random
 import sqlite3
+import sys
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-DATA_DIR = Path("/data")
+
+def _default_data_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "CloakBrowser Manager"
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home())
+        return Path(base) / "CloakBrowser Manager"
+    return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "CloakBrowser Manager"
+
+
+DATA_DIR = Path(os.environ.get("CBM_DATA_DIR") or _default_data_dir())
 DB_PATH = DATA_DIR / "profiles.db"
 
 

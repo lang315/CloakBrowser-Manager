@@ -103,8 +103,6 @@ def test_delete_profile_stops_running(app_client: TestClient):
 
     # Inject mock running profile
     mock_running = MagicMock(spec=RunningProfile)
-    mock_running.display = 100
-    mock_running.ws_port = 6100
     mock_running.cdp_port = 5100
     main.browser_mgr.running[pid] = mock_running
     main.browser_mgr.stop = AsyncMock()
@@ -268,7 +266,6 @@ def test_set_clipboard_success(app_client: TestClient):
 
     # Inject mock running profile
     mock_running = MagicMock(spec=RunningProfile)
-    mock_running.display = 100
     mock_running.cdp_port = 5100
     main.browser_mgr.running[pid] = mock_running
 
@@ -302,7 +299,6 @@ def test_get_clipboard_from_page(app_client: TestClient):
     mock_context.pages = [mock_page]
 
     mock_running = MagicMock(spec=RunningProfile)
-    mock_running.display = 100
     mock_running.cdp_port = 5100
     mock_running.context = mock_context
     main.browser_mgr.running[pid] = mock_running
@@ -351,8 +347,6 @@ def test_running_profile_has_cdp_url(app_client: TestClient):
     pid = create.json()["id"]
 
     mock_running = MagicMock(spec=RunningProfile)
-    mock_running.display = 100
-    mock_running.ws_port = 6100
     mock_running.cdp_port = 5100
     mock_running.profile_id = pid
     main.browser_mgr.running[pid] = mock_running
@@ -360,7 +354,7 @@ def test_running_profile_has_cdp_url(app_client: TestClient):
     resp = app_client.get(f"/api/profiles/{pid}")
     data = resp.json()
     assert data["status"] == "running"
-    assert data["cdp_url"] == f"/api/profiles/{pid}/cdp"
+    assert data["cdp_url"] == f"http://localhost/api/profiles/{pid}/cdp"
 
     # Cleanup
     main.browser_mgr.running.pop(pid, None)
@@ -382,8 +376,6 @@ def test_cdp_json_list_not_running(app_client: TestClient):
 def _mock_running_profile(pid: str) -> MagicMock:
     """Create a mock RunningProfile and register it in browser_mgr."""
     mock = MagicMock(spec=RunningProfile)
-    mock.display = 100
-    mock.ws_port = 6100
     mock.cdp_port = 5100
     mock.profile_id = pid
     main.browser_mgr.running[pid] = mock

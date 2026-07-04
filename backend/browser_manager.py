@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import socket
 import time
 from dataclasses import dataclass
@@ -13,8 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
-
-from .vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
 
@@ -150,8 +147,6 @@ CDP_PORT_RANGE = 100  # cycle through 5100-5199 to avoid TIME_WAIT collisions
 class RunningProfile:
     profile_id: str
     context: Any  # Playwright BrowserContext
-    display: int
-    ws_port: int
     cdp_port: int
 
 
@@ -159,7 +154,6 @@ class BrowserManager:
     def __init__(self):
         self.running: dict[str, RunningProfile] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
-        self.vnc = VNCManager()
         self._lock = asyncio.Lock()
         self._next_cdp_port = BASE_CDP_PORT
         self._auto_launch_task: asyncio.Task | None = None
@@ -173,14 +167,11 @@ class BrowserManager:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
 
-        display, ws_port = await self.vnc.allocate()
-
         try:
             cdp_port = self._allocate_cdp_port()
         except ValueError:
             async with self._lock:
                 self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
             raise
 
         # Clean stale Chromium lock files (left by previous container crashes)
@@ -193,14 +184,6 @@ class BrowserManager:
         _init_profile_defaults(user_data_dir)
 
         try:
-            # Start KasmVNC on the allocated display
-            await self.vnc.start_vnc(
-                display,
-                ws_port,
-                width=profile.get("screen_width", 1920),
-                height=profile.get("screen_height", 1080),
-            )
-
             # Build fingerprint args from profile settings
             extra_args = self._build_fingerprint_args(profile)
             extra_args += profile.get("launch_args") or []
@@ -212,8 +195,7 @@ class BrowserManager:
             if proxy:
                 _validate_proxy(proxy)
 
-            # Launch CloakBrowser on that display
-            # DISPLAY is passed via env kwarg to avoid process-wide os.environ mutation
+            # Launch CloakBrowser
             context = await launch_persistent_context_async(
                 user_data_dir=profile["user_data_dir"],
                 headless=bool(profile.get("headless", False)),
@@ -230,7 +212,6 @@ class BrowserManager:
                     "width": profile.get("screen_width", 1920),
                     "height": profile.get("screen_height", 1080) - 133,
                 },
-                env={**os.environ, "DISPLAY": f":{display}"},
             )
 
             # Inject clipboard listener: captures copied text on every page
@@ -259,12 +240,10 @@ class BrowserManager:
             running = RunningProfile(
                 profile_id=profile_id,
                 context=context,
-                display=display,
-                ws_port=ws_port,
                 cdp_port=cdp_port,
             )
 
-            # Auto-cleanup if browser crashes or user closes Chrome via VNC
+            # Auto-cleanup if browser crashes or user closes Chrome
             context.on("close", lambda: asyncio.ensure_future(
                 self._on_browser_closed(profile_id)
             ))
@@ -274,8 +253,8 @@ class BrowserManager:
                 self._launching.discard(profile_id)
 
             logger.info(
-                "Launched profile %s on display :%d (ws_port=%d, cdp_port=%d)",
-                profile_id, display, ws_port, cdp_port,
+                "Launched profile %s (cdp_port=%d)",
+                profile_id, cdp_port,
             )
 
             return running
@@ -283,17 +262,15 @@ class BrowserManager:
         except BaseException:
             async with self._lock:
                 self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
             raise
 
     async def _on_browser_closed(self, profile_id: str):
-        """Called when browser exits (crash, user closed via VNC, or stop())."""
+        """Called when browser exits (crash or stop())."""
         async with self._lock:
             running = self.running.pop(profile_id, None)
 
         if running:
             logger.info("Browser closed for profile %s, cleaning up", profile_id)
-            await self.vnc.stop_vnc(running.display)
 
     async def stop(self, profile_id: str):
         """Stop a running browser instance."""
@@ -311,19 +288,15 @@ class BrowserManager:
         except Exception as exc:
             logger.warning("Error closing context for %s: %s", profile_id, exc)
 
-        await self.vnc.stop_vnc(running.display)
-
     def get_status(self, profile_id: str) -> dict[str, Any]:
         """Get running status for a profile."""
         running = self.running.get(profile_id)
         if running:
             return {
                 "status": "running",
-                "vnc_ws_port": running.ws_port,
-                "display": f":{running.display}",
-                "cdp_url": f"/api/profiles/{profile_id}/cdp",
+                "cdp_url": f"http://localhost/api/profiles/{profile_id}/cdp",
             }
-        return {"status": "stopped", "vnc_ws_port": None, "display": None, "cdp_url": None}
+        return {"status": "stopped", "cdp_url": None}
 
     async def cleanup_all(self):
         """Stop all running profiles. Called on shutdown."""
@@ -333,11 +306,8 @@ class BrowserManager:
         for pid in profile_ids:
             await self.stop(pid)
 
-        await self.vnc.cleanup_all()
-
     async def cleanup_stale(self):
-        """Kill orphan processes from previous container runs."""
-        await self.vnc.cleanup_stale()
+        """No-op now that VNC orphan cleanup is gone; kept for lifespan() compatibility."""
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""

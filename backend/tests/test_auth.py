@@ -19,7 +19,6 @@ def client_no_auth(tmp_db, monkeypatch):
     monkeypatch.setattr(main, "AUTH_TOKEN", None)
     monkeypatch.setattr(main.browser_mgr, "cleanup_stale", AsyncMock())
     monkeypatch.setattr(main.browser_mgr, "cleanup_all", AsyncMock())
-    monkeypatch.setattr(main.browser_mgr.vnc, "cleanup_stale", AsyncMock())
 
     with TestClient(main.app) as client:
         yield client
@@ -33,7 +32,6 @@ def client_auth(tmp_db, monkeypatch):
     monkeypatch.setattr(main, "AUTH_TOKEN", "test-secret")
     monkeypatch.setattr(main.browser_mgr, "cleanup_stale", AsyncMock())
     monkeypatch.setattr(main.browser_mgr, "cleanup_all", AsyncMock())
-    monkeypatch.setattr(main.browser_mgr.vnc, "cleanup_stale", AsyncMock())
 
     with TestClient(main.app) as client:
         yield client

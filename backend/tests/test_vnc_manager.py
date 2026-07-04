@@ -96,7 +96,7 @@ def test_get_status_stopped():
     from backend.browser_manager import BrowserManager
     mgr = BrowserManager()
     status = mgr.get_status("nonexistent")
-    assert status == {"status": "stopped", "vnc_ws_port": None, "display": None, "cdp_url": None}
+    assert status == {"status": "stopped", "cdp_url": None}
 
 
 def test_get_status_running():
@@ -106,14 +106,10 @@ def test_get_status_running():
     mgr.running["abc"] = RunningProfile(
         profile_id="abc",
         context=MagicMock(),
-        display=100,
-        ws_port=6100,
         cdp_port=5100,
     )
     status = mgr.get_status("abc")
     assert status == {
         "status": "running",
-        "vnc_ws_port": 6100,
-        "display": ":100",
-        "cdp_url": "/api/profiles/abc/cdp",
+        "cdp_url": "http://localhost/api/profiles/abc/cdp",
     }
