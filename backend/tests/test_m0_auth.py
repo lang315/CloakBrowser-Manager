@@ -7,6 +7,7 @@ pytest session — AuthMiddleware reads it fresh from os.environ per request.
 from __future__ import annotations
 
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from backend.main import app
@@ -35,3 +36,24 @@ def test_index_sets_httponly_cookie_without_secure(client: TestClient, monkeypat
     r = client.get("/", headers={"Host": "localhost"})
     setc = r.headers.get("set-cookie", "")
     assert "cbm_ui=" in setc and "HttpOnly" in setc and "Secure" not in setc
+    assert "samesite=strict" in setc.lower()
+
+
+def test_ws_cdp_rejects_cleanly_instead_of_crashing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+):
+    """Regression: _check_cbm_cookie must not crash on WebSocket scopes.
+
+    It used to build a `starlette.requests.Request(scope)`, whose `__init__`
+    asserts `scope["type"] == "http"` — raising AssertionError for every
+    WebSocket connection (CDP/VNC) once CBM_UI_SECRET is set. It must instead
+    reject cleanly (WebSocketDisconnect with the auth-failure close code)
+    rather than crash.
+    """
+    monkeypatch.setenv("CBM_UI_SECRET", "test-secret")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            "/api/profiles/test-profile/cdp", headers={"Host": "localhost"}
+        ):
+            pass
+    assert exc_info.value.code == 4401

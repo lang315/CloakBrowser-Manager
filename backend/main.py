@@ -100,9 +100,22 @@ def _request_hostname(scope: Scope) -> str | None:
 
 
 def _check_cbm_cookie(scope: Scope, secret: str) -> bool:
-    """Validate the `cbm_ui` loopback UI cookie against CBM_UI_SECRET."""
-    cookie_val = starlette.requests.Request(scope).cookies.get("cbm_ui")
-    return bool(cookie_val) and hmac.compare_digest(cookie_val, secret)
+    """Validate the `cbm_ui` loopback UI cookie against CBM_UI_SECRET.
+
+    Reads the raw ASGI headers directly (like `_check_auth` above) instead of
+    constructing a `starlette.requests.Request`, whose `__init__` asserts
+    `scope["type"] == "http"` and raises on WebSocket scopes.
+    """
+    for key, val in scope.get("headers", []):
+        if key == b"cookie":
+            cookies = SimpleCookie()
+            cookies.load(val.decode())
+            if "cbm_ui" in cookies:
+                cookie_val = cookies["cbm_ui"].value
+                if cookie_val and hmac.compare_digest(cookie_val, secret):
+                    return True
+            break
+    return False
 
 
 def _cbm_set_cookie_header(secret: str) -> tuple[bytes, bytes]:
