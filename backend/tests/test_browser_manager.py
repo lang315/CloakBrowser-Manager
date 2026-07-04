@@ -138,8 +138,8 @@ def test_build_args_screen():
 
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
-    # Only the 3 base args
-    assert len(args) == 3
+    # 3 base args + platform fallback (falsy platform defaults to "windows")
+    assert len(args) == 4
 
 
 # ── launch_args appended to extra_args ────────────────────────────────────────

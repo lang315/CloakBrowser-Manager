@@ -187,6 +187,14 @@ class BrowserManager:
             # Build fingerprint args from profile settings
             extra_args = self._build_fingerprint_args(profile)
             extra_args += profile.get("launch_args") or []
+            # launch_args is user-supplied (PUT /api/profiles/{id}) and passed
+            # straight through to Chromium. Scrub --no-sandbox regardless of
+            # source so it can never reintroduce the sandbox-OFF RCE risk that
+            # chromium_sandbox=True below is meant to close.
+            extra_args = [
+                a for a in extra_args
+                if a != "--no-sandbox" and not a.startswith("--no-sandbox=")
+            ]
             extra_args.append(f"--remote-debugging-port={cdp_port}")
 
             # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
@@ -379,10 +387,14 @@ class BrowserManager:
         if seed is not None:
             args.append(f"--fingerprint={seed}")
 
-        p = profile.get("platform")
-        if p:
-            # Map our "macos" to binary's "macos"
-            args.append(f"--fingerprint-platform={p}")
+        # Always emit a platform spoof, even if the profile's platform is
+        # falsy (None/""). Previously this was guarded by `if p:`, relying on
+        # cloakbrowser's own stealth_args default to inject a fallback
+        # --fingerprint-platform when we didn't. Now that launch() passes
+        # stealth_args=False, that fallback no longer exists — an unset
+        # platform would silently launch with NO platform spoof at all.
+        p = profile.get("platform") or "windows"
+        args.append(f"--fingerprint-platform={p}")
 
         vendor = profile.get("gpu_vendor")
         if vendor:

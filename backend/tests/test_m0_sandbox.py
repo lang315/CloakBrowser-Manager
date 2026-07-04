@@ -77,3 +77,51 @@ async def test_launch_stealth_args_false_does_not_lose_fingerprint(
     assert "--fingerprint-platform=macos" in passed_args
     # Never our job to emit this — confirms it isn't sneaking back in via extra_args.
     assert "--no-sandbox" not in passed_args
+
+
+def test_build_fingerprint_args_platform_falls_back_to_windows():
+    """Regression guard for the fallback lost when stealth_args=False was
+    introduced: cloakbrowser's own stealth_args default used to always inject
+    --fingerprint-platform, masking a falsy `platform` on the profile. With
+    stealth_args=False that safety net is gone, so _build_fingerprint_args
+    itself must fall back to "windows" whenever platform is None, missing,
+    or an empty string — otherwise a profile saved via
+    PUT /api/profiles/{id} with {"platform": null} would launch with no
+    platform spoof at all."""
+    mgr = bm.BrowserManager()
+
+    args = mgr._build_fingerprint_args({"fingerprint_seed": 1, "platform": None})
+    assert "--fingerprint-platform=windows" in args
+
+    args = mgr._build_fingerprint_args({"fingerprint_seed": 1})
+    assert "--fingerprint-platform=windows" in args
+
+    args = mgr._build_fingerprint_args({"fingerprint_seed": 1, "platform": ""})
+    assert "--fingerprint-platform=windows" in args
+
+
+@pytest.mark.asyncio
+async def test_launch_scrubs_no_sandbox_from_launch_args(tmp_db, monkeypatch: pytest.MonkeyPatch):
+    """launch_args is user-supplied (PUT /api/profiles/{id}) and forwarded
+    straight to Chromium. If it contains --no-sandbox, that would defeat the
+    chromium_sandbox=True fix above and reopen the sandbox-OFF RCE risk.
+    Confirm it's scrubbed regardless of source, while unrelated user flags
+    still pass through."""
+    profile = db.create_profile(
+        name="Launch Args Sandbox Test",
+        fingerprint_seed=24680,
+        launch_args=["--no-sandbox", "--some-other-flag"],
+    )
+
+    fake_context = MagicMock()
+    fake_context.add_init_script = AsyncMock()
+    fake_context.pages = []
+    mock_launch = AsyncMock(return_value=fake_context)
+    monkeypatch.setattr(bm, "launch_persistent_context_async", mock_launch)
+
+    mgr = bm.BrowserManager()
+    await mgr.launch(profile)
+
+    passed_args = mock_launch.call_args.kwargs["args"]
+    assert "--some-other-flag" in passed_args
+    assert "--no-sandbox" not in passed_args
