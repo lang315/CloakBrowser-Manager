@@ -201,6 +201,27 @@ class BrowserManager:
                 headless=bool(profile.get("headless", False)),
                 proxy=proxy,
                 args=extra_args,
+                # --no-sandbox has TWO independent sources — both must be off:
+                # (1) cloakbrowser's own get_default_stealth_args() unconditionally
+                #     includes it (config.py); stealth_args=False skips that whole
+                #     default set. Nothing else is lost: the other two defaults it
+                #     would have added (--fingerprint=<seed>, --fingerprint-platform=)
+                #     are already supplied above via _build_fingerprint_args(), which
+                #     the DB guarantees are always set (fingerprint_seed is NOT NULL,
+                #     platform defaults to "windows"). The --enable-automation /
+                #     --enable-unsafe-swiftshader suppression (ignore_default_args)
+                #     is applied unconditionally by launch_persistent_context_async
+                #     regardless of stealth_args, so navigator.webdriver stays masked.
+                # (2) Playwright's OWN Chromium launcher pushes --no-sandbox by
+                #     default unless chromium_sandbox=True is passed explicitly
+                #     (_innerDefaultArgs(): `if options.chromiumSandbox !== true`).
+                #     cloakbrowser never sets this, so it must be passed here —
+                #     it flows through launch_persistent_context_async(**kwargs)
+                #     straight to Playwright's launch_persistent_context() call.
+                # Verified empirically (M0 Task 6): stealth_args=False alone still
+                # left --no-sandbox on the Chromium command line via source (2).
+                stealth_args=False,
+                chromium_sandbox=True,
                 timezone=profile.get("timezone") or None,
                 locale=profile.get("locale") or None,
                 humanize=bool(profile.get("humanize", False)),
