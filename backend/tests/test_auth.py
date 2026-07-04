@@ -20,7 +20,9 @@ def client_no_auth(tmp_db, monkeypatch):
     monkeypatch.setattr(main.browser_mgr, "cleanup_stale", AsyncMock())
     monkeypatch.setattr(main.browser_mgr, "cleanup_all", AsyncMock())
 
-    with TestClient(main.app) as client:
+    # base_url="http://localhost" — AuthMiddleware's exact Host-allowlist
+    # rejects TestClient's default Host ("testserver") with 403.
+    with TestClient(main.app, base_url="http://localhost") as client:
         yield client
 
 
@@ -33,7 +35,9 @@ def client_auth(tmp_db, monkeypatch):
     monkeypatch.setattr(main.browser_mgr, "cleanup_stale", AsyncMock())
     monkeypatch.setattr(main.browser_mgr, "cleanup_all", AsyncMock())
 
-    with TestClient(main.app) as client:
+    # base_url="http://localhost" — AuthMiddleware's exact Host-allowlist
+    # rejects TestClient's default Host ("testserver") with 403.
+    with TestClient(main.app, base_url="http://localhost") as client:
         yield client
 
 

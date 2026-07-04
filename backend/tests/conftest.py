@@ -56,5 +56,7 @@ def app_client(tmp_db: Path, monkeypatch: pytest.MonkeyPatch):
 
     from starlette.testclient import TestClient
 
-    with TestClient(main.app) as client:
+    # base_url="http://localhost" — AuthMiddleware's exact Host-allowlist
+    # rejects TestClient's default Host ("testserver") with 403.
+    with TestClient(main.app, base_url="http://localhost") as client:
         yield client

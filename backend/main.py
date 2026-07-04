@@ -53,6 +53,14 @@ AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 # Paths that bypass authentication even when AUTH_TOKEN is set
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status"})
 
+# M0 loopback cookie auth (spec §4.3): the exact Host-allowlist is always
+# enforced; the cbm_ui cookie is required for /api/* only once CBM_UI_SECRET
+# is configured — the desktop entrypoint always sets it (desktop/app_entry.py),
+# tests that don't set it keep today's cookie-less behavior. Read live from
+# os.environ (not cached at import time) so tests can scope it per-test.
+_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_CBM_COOKIE_EXEMPT = frozenset({"/api/status"})
+
 
 def _check_auth(scope: Scope) -> bool:
     """Check if the request has a valid auth token (header or cookie)."""
@@ -78,6 +86,41 @@ def _check_auth(scope: Scope) -> bool:
             break
 
     return False
+
+
+def _request_hostname(scope: Scope) -> str | None:
+    """Extract the bare hostname from the ASGI Host header (drops port/brackets)."""
+    for key, val in scope.get("headers", []):
+        if key == b"host":
+            try:
+                return urlparse(f"//{val.decode('latin-1')}").hostname
+            except ValueError:
+                return None
+    return None
+
+
+def _check_cbm_cookie(scope: Scope, secret: str) -> bool:
+    """Validate the `cbm_ui` loopback UI cookie against CBM_UI_SECRET."""
+    cookie_val = starlette.requests.Request(scope).cookies.get("cbm_ui")
+    return bool(cookie_val) and hmac.compare_digest(cookie_val, secret)
+
+
+def _cbm_set_cookie_header(secret: str) -> tuple[bytes, bytes]:
+    """Build the Set-Cookie ASGI header tuple for the loopback UI cookie."""
+    response = Response()
+    response.set_cookie(
+        key="cbm_ui", value=secret, httponly=True, samesite="strict", secure=False, path="/",
+    )
+    return next(h for h in response.raw_headers if h[0] == b"set-cookie")
+
+
+def _with_set_cookie(send: Send, header: tuple[bytes, bytes]) -> Send:
+    """Wrap an ASGI `send` to inject a Set-Cookie header into the response start."""
+    async def wrapped(message):
+        if message["type"] == "http.response.start":
+            message = {**message, "headers": [*message.get("headers", []), header]}
+        await send(message)
+    return wrapped
 
 
 def _is_https(request: Request) -> bool:
@@ -137,7 +180,8 @@ async def _check_websocket_origin(websocket: WebSocket) -> bool:
 
 
 class AuthMiddleware:
-    """Raw ASGI middleware for optional token auth.
+    """Raw ASGI middleware: exact Host-allowlist + loopback cookie auth (M0),
+    layered on top of the optional legacy AUTH_TOKEN bearer/cookie auth.
 
     Uses raw ASGI instead of BaseHTTPMiddleware because the latter
     breaks WebSocket routes (wraps request body, preventing WS upgrade).
@@ -147,29 +191,49 @@ class AuthMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        # Pass through if auth disabled, or non-HTTP/WS scope (e.g. lifespan)
-        if not AUTH_TOKEN or scope["type"] not in ("http", "websocket"):
+        # Non-HTTP/WS scopes (e.g. lifespan) bypass all checks below.
+        if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
+            return
+
+        # (a) Exact Host-allowlist — always enforced, HTTP and WS alike.
+        if _request_hostname(scope) not in _ALLOWED_HOSTS:
+            await self._reject(scope, receive, send, 403, 4403, "Forbidden host")
             return
 
         path = scope["path"]
+        cbm_secret = os.environ.get("CBM_UI_SECRET") or None
 
-        # Skip auth for exempt endpoints and non-API paths (static frontend)
-        if path in _AUTH_EXEMPT or not path.startswith("/api/"):
-            await self.app(scope, receive, send)
-            return
+        # (c) /api/* (except /api/status) requires the cbm_ui cookie.
+        if cbm_secret and path.startswith("/api/") and path not in _CBM_COOKIE_EXEMPT:
+            if not _check_cbm_cookie(scope, cbm_secret):
+                await self._reject(scope, receive, send, 401, 4401, "Unauthorized")
+                return
 
-        if _check_auth(scope):
-            await self.app(scope, receive, send)
-            return
+        # Legacy optional AUTH_TOKEN (Bearer header / auth_token cookie).
+        if AUTH_TOKEN and path.startswith("/api/") and path not in _AUTH_EXEMPT:
+            if not _check_auth(scope):
+                await self._reject(scope, receive, send, 401, 4401, "Unauthorized")
+                return
 
-        # Reject — unauthenticated
+        # (b) SPA index bootstrap: stamp the cbm_ui cookie so the webview's
+        # subsequent /api/* requests carry it.
+        if cbm_secret and scope["type"] == "http" and scope.get("method") == "GET" and path == "/":
+            send = _with_set_cookie(send, _cbm_set_cookie_header(cbm_secret))
+
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _reject(
+        scope: Scope, receive: Receive, send: Send,
+        status_code: int, ws_code: int, detail: str,
+    ) -> None:
         if scope["type"] == "websocket":
             # ASGI requires receiving websocket.connect before sending close
             await receive()
-            await send({"type": "websocket.close", "code": 4401, "reason": "Unauthorized"})
+            await send({"type": "websocket.close", "code": ws_code, "reason": detail})
         else:
-            response = JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            response = JSONResponse({"detail": detail}, status_code=status_code)
             await response(scope, receive, send)
 
 
