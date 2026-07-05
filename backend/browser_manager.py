@@ -388,7 +388,8 @@ class BrowserManager:
             return
 
         logger.info("Auto-launching %d profile(s)...", len(auto_profiles))
-        for profile in auto_profiles:
+        last = len(auto_profiles) - 1
+        for i, profile in enumerate(auto_profiles):
             try:
                 await asyncio.wait_for(self.launch(profile), timeout=60)
                 logger.info("Auto-launched profile %s (%s)", profile["name"], profile["id"])
@@ -397,6 +398,10 @@ class BrowserManager:
                     "Auto-launch failed for profile %s (%s): %s",
                     profile["name"], profile["id"], exc,
                 )
+            if i < last:
+                # Stagger launches so N first-run geoip downloads + N windows
+                # don't erupt simultaneously.
+                await asyncio.sleep(1.5)
         logger.info("Auto-launch complete: %d running", len(self.running))
 
     def _allocate_cdp_port(self) -> int:
