@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import time
 from dataclasses import dataclass
@@ -339,19 +340,27 @@ class BrowserManager:
 
     async def cleanup_stale(self):
         """Kill orphaned Chromium from a prior run + delete stale singleton locks.
-        Identifies OUR processes ONLY by our profiles dir in the command line —
-        NEVER by process name (the binary is named 'Chromium')."""
+        Identifies OUR processes ONLY by a --user-data-dir= argument pointing at our
+        profiles dir — NEVER by process name (the binary is named 'Chromium') and
+        NEVER by a bare substring match anywhere in the command line."""
         import psutil
-        profiles_root = str(db.DATA_DIR / "profiles")
+        profiles_root = str((db.DATA_DIR / "profiles").resolve())
+        marker = "--user-data-dir="
         for proc in psutil.process_iter(["cmdline"]):
             try:
+                if proc.pid == os.getpid():
+                    continue
                 cmdline = proc.info.get("cmdline") or []
-                if any(profiles_root in str(a) for a in cmdline):
+                if any(a.startswith(marker) and a[len(marker):].startswith(profiles_root) for a in cmdline):
+                    logger.warning("Killing orphan Chromium pid=%s cmdline=%s", proc.pid, cmdline)
                     proc.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
         for lock in Path(profiles_root).glob("*/Singleton*"):
-            lock.unlink(missing_ok=True)
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Failed to unlink stale lock %s", lock)
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""
