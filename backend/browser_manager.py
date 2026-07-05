@@ -295,7 +295,9 @@ class BrowserManager:
                 except Exception as exc:
                     logger.debug("Clipboard init failed on existing page: %s", exc)
 
-            await self._raise_window(context, profile_id)
+            # Fire-and-forget: raising the window is best-effort UX and must not
+            # sit on the launch path (mirrors the context.on("close") handler below).
+            asyncio.ensure_future(self._raise_window(context, profile_id))
 
             running = RunningProfile(
                 profile_id=profile_id,
