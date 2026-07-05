@@ -198,6 +198,10 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
     # Pre-serialize launch_args to JSON before the generic update loop
     if "launch_args" in fields:
         fields["launch_args"] = json.dumps(fields["launch_args"] or [])
+    # Mirror create_profile: never persist a falsy platform. Otherwise SQL NULL
+    # hits ProfileResponse.platform: str and 500s on the next GET/LIST.
+    if "platform" in fields and not fields["platform"]:
+        fields["platform"] = host_platform()
 
     for col in (
         "name", "fingerprint_seed", "proxy", "timezone", "locale", "platform",

@@ -39,3 +39,22 @@ def test_cleanup_stale_skips_own_pid(tmp_db):
     with patch("psutil.process_iter", return_value=[self_proc]):
         asyncio.run(bm.BrowserManager().cleanup_stale())
     self_proc.kill.assert_not_called()
+
+def test_cleanup_stale_kills_chromium_when_data_dir_is_symlink(tmp_path, monkeypatch):
+    """profiles_root is resolved via .resolve(), but database.py writes an
+    UNresolved --user-data-dir= value (str(DATA_DIR / "profiles" / id)). If
+    DATA_DIR is a symlink to a real directory, the arg must be realpath'd
+    before comparing, or every orphan launched while DATA_DIR was a symlink
+    would survive cleanup."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link"
+    link_dir.symlink_to(real_dir)
+    monkeypatch.setattr(bm.db, "DATA_DIR", link_dir)
+
+    unresolved_user_data_dir = str(link_dir / "profiles" / "abc")  # mirrors database.py
+    ours = MagicMock()
+    ours.info = {"cmdline": ["Chromium", f"--user-data-dir={unresolved_user_data_dir}"]}
+    with patch("psutil.process_iter", return_value=[ours]):
+        asyncio.run(bm.BrowserManager().cleanup_stale())
+    ours.kill.assert_called_once()

@@ -196,7 +196,16 @@ class BrowserManager:
             # deployment, which requires --no-sandbox (no unprivileged user
             # namespaces inside the container) — that path must keep the M0
             # sandbox-OFF behavior below instead of the desktop default.
-            _desktop = not os.environ.get("CBM_CONTAINER")
+            # Parsed as an explicit allow-list (not bool(str)) so a falsy-looking
+            # value like CBM_CONTAINER=0, or any other stray inherited value,
+            # can't silently select container mode and turn the sandbox off.
+            _container = os.environ.get("CBM_CONTAINER", "").strip().lower() in {"1", "true", "yes"}
+            _desktop = not _container
+            logger.info(
+                "launch mode=%s sandbox=%s",
+                "desktop" if _desktop else "container",
+                _desktop,
+            )
 
             if _desktop:
                 # launch_args is user-supplied (PUT /api/profiles/{id}) and passed
@@ -359,7 +368,12 @@ class BrowserManager:
         """Kill orphaned Chromium from a prior run + delete stale singleton locks.
         Identifies OUR processes ONLY by a --user-data-dir= argument pointing at our
         profiles dir — NEVER by process name (the binary is named 'Chromium') and
-        NEVER by a bare substring match anywhere in the command line."""
+        NEVER by a bare substring match anywhere in the command line.
+
+        profiles_root is resolved, but database.py writes UNresolved
+        --user-data-dir= values (str(DATA_DIR / "profiles" / id)). If DATA_DIR is
+        (or contains) a symlink, an unresolved arg would never match a resolved
+        root, so the arg is realpath'd here too before comparing."""
         import psutil
         profiles_root = str((db.DATA_DIR / "profiles").resolve())
         marker = "--user-data-dir="
@@ -368,7 +382,10 @@ class BrowserManager:
                 if proc.pid == os.getpid():
                     continue
                 cmdline = proc.info.get("cmdline") or []
-                if any(a.startswith(marker) and a[len(marker):].startswith(profiles_root) for a in cmdline):
+                if any(
+                    a.startswith(marker) and os.path.realpath(a[len(marker):]).startswith(profiles_root)
+                    for a in cmdline
+                ):
                     logger.warning("Killing orphan Chromium pid=%s cmdline=%s", proc.pid, cmdline)
                     proc.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
