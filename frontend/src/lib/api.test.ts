@@ -116,6 +116,44 @@ describe("api.getClipboard", () => {
   });
 });
 
+// ── CDP control (M1c) ────────────────────────────────────────────────────────
+
+describe("api CDP control", () => {
+  it("listTabs GETs the cdp json/list path", async () => {
+    const tabs = [{ id: "T1", type: "page", title: "X", url: "https://x.com" }];
+    mockFetch.mockResolvedValueOnce(jsonResponse(tabs));
+    const result = await api.listTabs("p1");
+    expect(result).toEqual(tabs);
+    expect(mockFetch).toHaveBeenCalledWith("/api/profiles/p1/cdp/json/list", {
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+
+  it("activateTab POSTs to the activate path", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    await api.activateTab("p1", "T1");
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/profiles/p1/cdp/json/activate/T1");
+    expect(options.method).toBe("POST");
+  });
+
+  it("openUrl POSTs to the new-tab path with an encoded url", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ id: "T2", type: "page", title: "", url: "https://a.com/?q=1" }));
+    await api.openUrl("p1", "https://a.com/?q=1");
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/profiles/p1/cdp/json/new?url=https%3A%2F%2Fa.com%2F%3Fq%3D1");
+    expect(options.method).toBe("POST");
+  });
+
+  it("closeTab POSTs to the close path", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    await api.closeTab("p1", "T1");
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/profiles/p1/cdp/json/close/T1");
+    expect(options.method).toBe("POST");
+  });
+});
+
 // ── Error handling ──────────────────────────────────────────────────────────
 
 describe("error handling", () => {

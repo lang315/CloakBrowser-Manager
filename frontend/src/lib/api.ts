@@ -73,7 +73,15 @@ export interface SystemStatus {
   profiles_total: number;
 }
 
-class ApiError extends Error {
+export interface CdpTarget {
+  id: string;
+  type: string;
+  title: string;
+  url: string;
+  webSocketDebuggerUrl?: string;
+}
+
+export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
@@ -155,4 +163,22 @@ export const api = {
 
   getClipboard: (id: string) =>
     request<{ text: string }>(`/api/profiles/${id}/clipboard`),
+
+  listTabs: (id: string) =>
+    request<CdpTarget[]>(`/api/profiles/${id}/cdp/json/list`),
+
+  activateTab: (id: string, targetId: string) =>
+    request<{ ok: boolean }>(`/api/profiles/${id}/cdp/json/activate/${targetId}`, {
+      method: "POST",
+    }),
+
+  openUrl: (id: string, url: string) =>
+    request<CdpTarget>(`/api/profiles/${id}/cdp/json/new?url=${encodeURIComponent(url)}`, {
+      method: "POST",
+    }),
+
+  closeTab: (id: string, targetId: string) =>
+    request<{ ok: boolean }>(`/api/profiles/${id}/cdp/json/close/${targetId}`, {
+      method: "POST",
+    }),
 };
