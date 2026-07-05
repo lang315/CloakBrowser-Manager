@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { RunningPanel } from "./RunningPanel";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -46,5 +46,36 @@ describe("RunningPanel", () => {
     });
     fireEvent.click(screen.getByText("Go"));
     await waitFor(() => expect(api.openUrl).toHaveBeenCalledWith("p1", "https://x.com"));
+  });
+
+  it("calls onDisconnect when the poll returns 404 (profile stopped)", async () => {
+    const onDisconnect = vi.fn();
+    (api.listTabs as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new ApiError(404, "Profile not running"),
+    );
+    render(<RunningPanel profileId="p1" cdpUrl={null} onDisconnect={onDisconnect} />);
+    await waitFor(() => expect(onDisconnect).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps the last tab list and does not disconnect on a transient (non-404) error", async () => {
+    vi.useFakeTimers();
+    try {
+      const onDisconnect = vi.fn();
+      (api.listTabs as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([tab])                      // initial poll succeeds
+        .mockRejectedValue(new ApiError(500, "boom"));     // every later poll fails (transient)
+      render(<RunningPanel profileId="p1" cdpUrl={null} onDisconnect={onDisconnect} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);              // flush initial refresh()
+      });
+      expect(screen.getByText("DuckDuckGo")).toBeTruthy();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);           // fire the 2s interval → failing poll
+      });
+      expect(onDisconnect).not.toHaveBeenCalled();
+      expect(screen.getByText("DuckDuckGo")).toBeTruthy(); // last list preserved
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
