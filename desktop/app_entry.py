@@ -1,7 +1,7 @@
 """Frozen desktop entrypoint: env-sanitize → uvicorn (bg thread) → pywebview (main thread)."""
 import os, sys, socket, threading, time, secrets, asyncio, urllib.request
 
-CANON_HOST = "localhost"
+CANON_HOST = "127.0.0.1"  # bind == address == cookie host == allowlist member; avoids localhost→::1 ambiguity
 
 def sanitize_frozen_env() -> None:
     """Strip PyInstaller's _MEIPASS from the dynamic-loader paths so spawned
@@ -36,7 +36,27 @@ def _wait_ready(port: int, timeout: float = 30.0) -> None:
             time.sleep(0.2)
     raise RuntimeError("backend did not become ready")
 
+def _setup_stdio() -> None:
+    """Windowed frozen apps (console=False) have sys.stdout/stderr = None, which
+    crashes uvicorn's log formatter (`.isatty()` on None) at Config() — before any
+    window opens. Route the None streams to a log file: fixes the crash AND gives
+    persistent diagnostics under <DATA_DIR>/logs/app.log."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        import backend.database as db
+        log_dir = db.DATA_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        f = open(log_dir / "app.log", "a", buffering=1, encoding="utf-8", errors="replace")
+    except Exception:
+        f = open(os.devnull, "w")
+    if sys.stdout is None:
+        sys.stdout = f
+    if sys.stderr is None:
+        sys.stderr = f
+
 def main() -> None:
+    _setup_stdio()  # MUST run before uvicorn — None stdio crashes its log formatter
     # Windows: Playwright's async subprocess needs the Proactor loop policy.
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -53,7 +73,7 @@ def main() -> None:
     import uvicorn
     port = pick_port()
     os.environ["CBM_PORT"] = str(port)
-    config = uvicorn.Config("backend.main:app", host="127.0.0.1", port=port,
+    config = uvicorn.Config("backend.main:app", host=CANON_HOST, port=port,
                             log_level="warning", loop="asyncio")
     server = uvicorn.Server(config)
     threading.Thread(target=server.run, daemon=True).start()
