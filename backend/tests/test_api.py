@@ -563,16 +563,31 @@ def test_cdp_new_returns_target(app_client: TestClient):
     chrome_response = MagicMock()
     chrome_response.status_code = 200
     chrome_response.json.return_value = {"id": "T2", "type": "page", "url": "https://example.com"}
-    with patch("httpx.AsyncClient", return_value=_mock_httpx(chrome_response)):
+    mock_client = _mock_httpx(chrome_response)
+    with patch("httpx.AsyncClient", return_value=mock_client):
         resp = app_client.post(f"/api/profiles/{pid}/cdp/json/new?url=https://example.com")
     assert resp.status_code == 200
     assert resp.json()["url"] == "https://example.com"
+    assert mock_client.put.await_args.args[0] == "http://127.0.0.1:5100/json/new?https%3A%2F%2Fexample.com"
     main.browser_mgr.running.pop(pid, None)
 
 
 def test_cdp_new_not_running(app_client: TestClient):
     resp = app_client.post("/api/profiles/nonexistent/cdp/json/new")
     assert resp.status_code == 404
+
+
+def test_cdp_new_bad_json_returns_502(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "NewBad"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    chrome_response = MagicMock()
+    chrome_response.status_code = 200
+    chrome_response.json.side_effect = ValueError("not json")
+    with patch("httpx.AsyncClient", return_value=_mock_httpx(chrome_response)):
+        resp = app_client.post(f"/api/profiles/{pid}/cdp/json/new?url=https://x.com")
+    assert resp.status_code == 502
+    main.browser_mgr.running.pop(pid, None)
 
 
 # ── WebSocket Origin Validation ──────────────────────────────────────────────

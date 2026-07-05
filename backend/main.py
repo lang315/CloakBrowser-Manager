@@ -927,12 +927,13 @@ async def cdp_new(profile_id: str, url: str = ""):
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.put(target, timeout=5)
+            data = resp.json() if resp.status_code < 400 else None
     except Exception as exc:
         logger.error("CDP proxy: new-tab failed for %s: %s", profile_id, exc)
         raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
     if resp.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"CDP new-tab rejected ({resp.status_code})")
-    return resp.json()
+    return data
 
 
 async def _proxy_cdp_websocket(
