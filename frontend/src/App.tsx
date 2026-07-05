@@ -4,7 +4,7 @@ import { useProfiles } from "./hooks/useProfiles";
 import { api, setOnUnauthorized, type ProfileCreateData } from "./lib/api";
 import { ProfileList } from "./components/ProfileList";
 import { ProfileForm } from "./components/ProfileForm";
-import { ProfileViewer } from "./components/ProfileViewer";
+import { RunningPanel } from "./components/RunningPanel";
 import { LaunchButton } from "./components/LaunchButton";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { LoginPage } from "./components/LoginPage";
@@ -243,11 +243,10 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
           )}
 
           {view === "view" && selected && selected.status === "running" && (
-            <ProfileViewer
+            <RunningPanel
               key={selected.id}
               profileId={selected.id}
               cdpUrl={selected.cdp_url}
-              clipboardSync={selected.clipboard_sync}
               onDisconnect={handleVncDisconnect}
             />
           )}
