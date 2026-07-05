@@ -95,3 +95,10 @@ No `--no-sandbox` anywhere in the line (nor in any GPU/renderer/utility helper's
   Worked from the bundled dispatch instructions plus the master plan
   (`docs/superpowers/plans/2026-07-04-cloakbrowser-desktop-m0-spike.md`,
   Task 5/6 sections) instead.
+
+## Task 7 — authenticated proxy verification
+
+**PASS** — launch returned 200, proxy auth succeeded (no 407), the exit IP
+(`116.103.143.251`) differed from the Mac's real IP (`113.161.217.82`), and
+the Playwright `connect_over_cdp` round-trip worked. No credentials in this
+line by design. Full detail: `.superpowers/sdd/m0-task-7-report.md`.
