@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -262,3 +263,31 @@ def test_init_idempotent(tmp_path: Path):
     # Second call should NOT overwrite (file already exists)
     _init_profile_defaults(tmp_path)
     assert bookmarks_path.read_text() == "SENTINEL"
+
+
+# ── _raise_window (M1c auto-raise) ───────────────────────────────────────────
+
+
+async def test_raise_window_brings_first_page_to_front():
+    mgr = BrowserManager()
+    page = AsyncMock()
+    context = MagicMock()
+    context.pages = [page]
+    await mgr._raise_window(context, "pid")
+    page.bring_to_front.assert_awaited_once()
+
+
+async def test_raise_window_swallows_errors():
+    mgr = BrowserManager()
+    page = AsyncMock()
+    page.bring_to_front = AsyncMock(side_effect=RuntimeError("boom"))
+    context = MagicMock()
+    context.pages = [page]
+    await mgr._raise_window(context, "pid")  # must not raise
+
+
+async def test_raise_window_no_pages_is_noop():
+    mgr = BrowserManager()
+    context = MagicMock()
+    context.pages = []
+    await mgr._raise_window(context, "pid")  # must not raise

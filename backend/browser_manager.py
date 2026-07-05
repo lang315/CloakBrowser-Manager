@@ -295,6 +295,8 @@ class BrowserManager:
                 except Exception as exc:
                     logger.debug("Clipboard init failed on existing page: %s", exc)
 
+            await self._raise_window(context, profile_id)
+
             running = RunningProfile(
                 profile_id=profile_id,
                 context=context,
@@ -321,6 +323,16 @@ class BrowserManager:
             async with self._lock:
                 self._launching.discard(profile_id)
             raise
+
+    async def _raise_window(self, context, profile_id: str) -> None:
+        """Bring the profile's first page/window to the foreground so the native
+        Chromium window isn't hidden behind the app window. Guarded — a failure
+        here must never fail the launch (harmless no-op in the container)."""
+        try:
+            if context.pages:
+                await context.pages[0].bring_to_front()
+        except Exception as exc:
+            logger.warning("bring_to_front failed for %s: %s", profile_id, exc)
 
     async def _on_browser_closed(self, profile_id: str):
         """Called when browser exits (crash or stop())."""
