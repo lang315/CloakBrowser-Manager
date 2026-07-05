@@ -190,14 +190,25 @@ class BrowserManager:
             # Build fingerprint args from profile settings
             extra_args = self._build_fingerprint_args(profile)
             extra_args += profile.get("launch_args") or []
-            # launch_args is user-supplied (PUT /api/profiles/{id}) and passed
-            # straight through to Chromium. Scrub --no-sandbox regardless of
-            # source so it can never reintroduce the sandbox-OFF RCE risk that
-            # chromium_sandbox=True below is meant to close.
-            extra_args = [
-                a for a in extra_args
-                if a != "--no-sandbox" and not a.startswith("--no-sandbox=")
-            ]
+
+            # M1a: desktop is the default deployment target (sandbox ON).
+            # entrypoint.sh exports CBM_CONTAINER=1 for the Docker/container
+            # deployment, which requires --no-sandbox (no unprivileged user
+            # namespaces inside the container) — that path must keep the M0
+            # sandbox-OFF behavior below instead of the desktop default.
+            _desktop = not os.environ.get("CBM_CONTAINER")
+
+            if _desktop:
+                # launch_args is user-supplied (PUT /api/profiles/{id}) and passed
+                # straight through to Chromium. Scrub --no-sandbox regardless of
+                # source so it can never reintroduce the sandbox-OFF RCE risk that
+                # chromium_sandbox=True below is meant to close. Container mode
+                # leaves launch_args untouched so an operator can still pass
+                # --no-sandbox explicitly.
+                extra_args = [
+                    a for a in extra_args
+                    if a != "--no-sandbox" and not a.startswith("--no-sandbox=")
+                ]
             extra_args.append(f"--remote-debugging-port={cdp_port}")
 
             # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
@@ -206,13 +217,19 @@ class BrowserManager:
             if proxy:
                 _validate_proxy(proxy)
 
+            # chromium_sandbox is omitted entirely in container mode so
+            # Playwright's own --no-sandbox default applies (see (2) below).
+            _chromium_sandbox_kwargs = {"chromium_sandbox": True} if _desktop else {}
+
             # Launch CloakBrowser
             context = await launch_persistent_context_async(
                 user_data_dir=profile["user_data_dir"],
                 headless=bool(profile.get("headless", False)),
                 proxy=proxy,
                 args=extra_args,
-                # --no-sandbox has TWO independent sources — both must be off:
+                # --no-sandbox has TWO independent sources — both must be off
+                # on desktop (both left at their library defaults in container
+                # mode, which include --no-sandbox):
                 # (1) cloakbrowser's own get_default_stealth_args() unconditionally
                 #     includes it (config.py); stealth_args=False skips that whole
                 #     default set. Nothing else is lost: the other two defaults it
@@ -231,8 +248,8 @@ class BrowserManager:
                 #     straight to Playwright's launch_persistent_context() call.
                 # Verified empirically (M0 Task 6): stealth_args=False alone still
                 # left --no-sandbox on the Chromium command line via source (2).
-                stealth_args=False,
-                chromium_sandbox=True,
+                stealth_args=(False if _desktop else True),
+                **_chromium_sandbox_kwargs,
                 timezone=profile.get("timezone") or None,
                 locale=profile.get("locale") or None,
                 humanize=bool(profile.get("humanize", False)),
