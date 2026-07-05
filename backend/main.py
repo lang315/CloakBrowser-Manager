@@ -25,6 +25,7 @@ import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import database as db
+from . import single_instance
 from .browser_manager import BrowserManager
 from .models import (
     ClipboardRequest,
@@ -253,6 +254,10 @@ class AuthMiddleware:
 # Singleton browser manager
 browser_mgr = BrowserManager()
 
+# Held for the process lifetime once acquired in lifespan() — prevents two
+# CloakBrowser Manager instances from running against the same profiles.db.
+_instance_lock: object | None = None
+
 # Frontend build directory (React production build)
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 
@@ -451,6 +456,12 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _instance_lock
+    _instance_lock = single_instance.acquire(db.DATA_DIR / "app.lock")
+    if _instance_lock is None:
+        logger.error("Another CloakBrowser Manager instance is already running.")
+        raise SystemExit(1)
+
     db.init_db()
     await browser_mgr.cleanup_stale()
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
@@ -461,6 +472,9 @@ async def lifespan(app: FastAPI):
         browser_mgr._auto_launch_task.cancel()
         await asyncio.gather(browser_mgr._auto_launch_task, return_exceptions=True)
     await browser_mgr.cleanup_all()
+    if _instance_lock is not None:
+        _instance_lock.close()
+        _instance_lock = None
 
 
 app = FastAPI(title="CloakBrowser Manager", lifespan=lifespan)
