@@ -13,6 +13,8 @@ from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
 
+from . import database as db
+
 logger = logging.getLogger("cloakbrowser.manager.browser")
 
 
@@ -336,12 +338,23 @@ class BrowserManager:
             await self.stop(pid)
 
     async def cleanup_stale(self):
-        """No-op now that VNC orphan cleanup is gone; kept for lifespan() compatibility."""
+        """Kill orphaned Chromium from a prior run + delete stale singleton locks.
+        Identifies OUR processes ONLY by our profiles dir in the command line —
+        NEVER by process name (the binary is named 'Chromium')."""
+        import psutil
+        profiles_root = str(db.DATA_DIR / "profiles")
+        for proc in psutil.process_iter(["cmdline"]):
+            try:
+                cmdline = proc.info.get("cmdline") or []
+                if any(profiles_root in str(a) for a in cmdline):
+                    proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        for lock in Path(profiles_root).glob("*/Singleton*"):
+            lock.unlink(missing_ok=True)
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""
-        from . import database as db
-
         profiles = db.list_profiles()
         auto_profiles = [p for p in profiles if p.get("auto_launch")]
         if not auto_profiles:
