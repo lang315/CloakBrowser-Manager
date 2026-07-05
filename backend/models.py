@@ -13,7 +13,7 @@ class ProfileCreate(BaseModel):
     proxy: str | None = None  # "http://user:pass@host:port" or null
     timezone: str | None = None  # "America/New_York"
     locale: str | None = None  # "en-US"
-    platform: Literal["windows", "macos", "linux"] = "windows"
+    platform: Literal["windows", "macos", "linux"] | None = None
     user_agent: str | None = None
     screen_width: int = 1920
     screen_height: int = 1080
@@ -75,6 +75,7 @@ class ProfileResponse(BaseModel):
     timezone: str | None = None
     locale: str | None = None
     platform: str = "windows"
+    platform_detectable: bool = False
     user_agent: str | None = None
     screen_width: int = 1920
     screen_height: int = 1080

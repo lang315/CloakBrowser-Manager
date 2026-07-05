@@ -42,7 +42,7 @@ def test_create_profile_minimal(tmp_db: Path):
     assert isinstance(p["id"], str) and len(p["id"]) == 36  # UUID
     assert 10000 <= p["fingerprint_seed"] <= 99999  # random default
     assert p["user_data_dir"].startswith(str(tmp_db))
-    assert p["platform"] == "windows"
+    assert p["platform"] == db.host_platform()
     assert p["created_at"] is not None
     assert p["updated_at"] is not None
 
@@ -97,7 +97,7 @@ def test_create_profile_with_tags(tmp_db: Path):
 
 def test_create_profile_defaults(tmp_db: Path):
     p = db.create_profile("Defaults")
-    assert p["platform"] == "windows"
+    assert p["platform"] == db.host_platform()
     assert p["screen_width"] == 1920
     assert p["screen_height"] == 1080
     assert p["humanize"] == 0

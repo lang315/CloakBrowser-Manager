@@ -219,7 +219,7 @@ class BrowserManager:
                 #     would have added (--fingerprint=<seed>, --fingerprint-platform=)
                 #     are already supplied above via _build_fingerprint_args(), which
                 #     the DB guarantees are always set (fingerprint_seed is NOT NULL,
-                #     platform defaults to "windows"). The --enable-automation /
+                #     platform defaults to the host OS). The --enable-automation /
                 #     --enable-unsafe-swiftshader suppression (ignore_default_args)
                 #     is applied unconditionally by launch_persistent_context_async
                 #     regardless of stealth_args, so navigator.webdriver stays masked.
@@ -415,7 +415,7 @@ class BrowserManager:
         # --fingerprint-platform when we didn't. Now that launch() passes
         # stealth_args=False, that fallback no longer exists — an unset
         # platform would silently launch with NO platform spoof at all.
-        p = profile.get("platform") or "windows"
+        p = profile.get("platform") or db.host_platform()
         args.append(f"--fingerprint-platform={p}")
 
         vendor = profile.get("gpu_vendor")

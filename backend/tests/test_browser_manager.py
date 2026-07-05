@@ -138,7 +138,7 @@ def test_build_args_screen():
 
 def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
-    # 3 base args + platform fallback (falsy platform defaults to "windows")
+    # 3 base args + platform fallback (falsy platform defaults to host OS)
     assert len(args) == 4
 
 

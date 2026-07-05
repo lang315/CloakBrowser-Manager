@@ -520,6 +520,7 @@ async def list_profiles():
         status = browser_mgr.get_status(p["id"])
         p["status"] = status["status"]
         p["cdp_url"] = status["cdp_url"]
+        p["platform_detectable"] = p["platform"] != db.host_platform()
         p["tags"] = [TagResponse(**t) for t in p.get("tags", [])]
         result.append(ProfileResponse(**p))
     return result
@@ -537,6 +538,7 @@ async def create_profile(req: ProfileCreate):
     status = browser_mgr.get_status(profile["id"])
     profile["status"] = status["status"]
     profile["cdp_url"] = status["cdp_url"]
+    profile["platform_detectable"] = profile["platform"] != db.host_platform()
     profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
     return ProfileResponse(**profile)
 
@@ -549,6 +551,7 @@ async def get_profile(profile_id: str):
     status = browser_mgr.get_status(profile_id)
     profile["status"] = status["status"]
     profile["cdp_url"] = status["cdp_url"]
+    profile["platform_detectable"] = profile["platform"] != db.host_platform()
     profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
     return ProfileResponse(**profile)
 
@@ -566,6 +569,7 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     status = browser_mgr.get_status(profile_id)
     profile["status"] = status["status"]
     profile["cdp_url"] = status["cdp_url"]
+    profile["platform_detectable"] = profile["platform"] != db.host_platform()
     profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
     return ProfileResponse(**profile)
 

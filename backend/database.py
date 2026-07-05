@@ -96,6 +96,10 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def host_platform() -> str:
+    return {"darwin": "macos", "win32": "windows"}.get(sys.platform, "linux")
+
+
 def create_profile(
     name: str,
     fingerprint_seed: int | None = None,
@@ -121,7 +125,7 @@ def create_profile(
                 fields.get("proxy"),
                 fields.get("timezone"),
                 fields.get("locale"),
-                fields.get("platform", "windows"),
+                fields.get("platform") or host_platform(),
                 fields.get("user_agent"),
                 fields.get("screen_width", 1920),
                 fields.get("screen_height", 1080),

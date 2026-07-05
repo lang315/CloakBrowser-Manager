@@ -79,25 +79,25 @@ async def test_launch_stealth_args_false_does_not_lose_fingerprint(
     assert "--no-sandbox" not in passed_args
 
 
-def test_build_fingerprint_args_platform_falls_back_to_windows():
+def test_build_fingerprint_args_platform_falls_back_to_host_platform():
     """Regression guard for the fallback lost when stealth_args=False was
     introduced: cloakbrowser's own stealth_args default used to always inject
     --fingerprint-platform, masking a falsy `platform` on the profile. With
     stealth_args=False that safety net is gone, so _build_fingerprint_args
-    itself must fall back to "windows" whenever platform is None, missing,
-    or an empty string — otherwise a profile saved via
-    PUT /api/profiles/{id} with {"platform": null} would launch with no
-    platform spoof at all."""
+    itself must fall back to the host OS (M1a: was hardcoded "windows")
+    whenever platform is None, missing, or an empty string — otherwise a
+    profile saved via PUT /api/profiles/{id} with {"platform": null} would
+    launch with no platform spoof at all."""
     mgr = bm.BrowserManager()
 
     args = mgr._build_fingerprint_args({"fingerprint_seed": 1, "platform": None})
-    assert "--fingerprint-platform=windows" in args
+    assert f"--fingerprint-platform={db.host_platform()}" in args
 
     args = mgr._build_fingerprint_args({"fingerprint_seed": 1})
-    assert "--fingerprint-platform=windows" in args
+    assert f"--fingerprint-platform={db.host_platform()}" in args
 
     args = mgr._build_fingerprint_args({"fingerprint_seed": 1, "platform": ""})
-    assert "--fingerprint-platform=windows" in args
+    assert f"--fingerprint-platform={db.host_platform()}" in args
 
 
 @pytest.mark.asyncio
