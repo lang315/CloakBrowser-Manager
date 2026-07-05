@@ -11,7 +11,6 @@ import hmac
 import logging
 import os
 import struct
-import shutil
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -588,6 +587,23 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
     return ProfileResponse(**profile)
 
 
+def _rmtree_with_retry(path, attempts: int = 5, delay: float = 0.2) -> None:
+    """Remove a profile dir, retrying to survive Chromium's async lock release on Windows."""
+    import shutil, time
+    p = Path(path)
+    if not p.exists():
+        return
+    last: Exception | None = None
+    for _ in range(attempts):
+        try:
+            shutil.rmtree(p)
+            return
+        except OSError as exc:
+            last = exc
+            time.sleep(delay)
+    raise last  # surface it — do not silently leave an orphan
+
+
 @app.delete("/api/profiles/{profile_id}")
 async def delete_profile(profile_id: str):
     # Stop browser if running
@@ -603,9 +619,18 @@ async def delete_profile(profile_id: str):
     # DB first — if this fails, filesystem is untouched
     db.delete_profile(profile_id)
 
-    # Then clean up disk
-    if user_data_dir.exists():
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+    # Then clean up disk, retrying to survive Chromium's async lock release
+    try:
+        _rmtree_with_retry(user_data_dir)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Profile record deleted, but failed to remove its data directory "
+                f"({user_data_dir}) after repeated retries: {exc}. "
+                "The directory may need manual removal once the process holding it exits."
+            ),
+        )
 
     return {"ok": True}
 
