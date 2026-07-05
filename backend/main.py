@@ -14,7 +14,7 @@ import struct
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -871,6 +871,68 @@ async def cdp_json_list(profile_id: str, request: Request):
                 f"{ws_scheme}://{host}/api/profiles/{profile_id}/cdp/devtools/{ws_path}"
             )
     return data
+
+
+@app.post("/api/profiles/{profile_id}/cdp/json/activate/{target_id}")
+async def cdp_activate(profile_id: str, target_id: str):
+    """Activate (raise + focus) a CDP target. Chrome raises the OS window."""
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"http://127.0.0.1:{running.cdp_port}/json/activate/{target_id}", timeout=5
+            )
+    except Exception as exc:
+        logger.error("CDP proxy: activate failed for %s: %s", profile_id, exc)
+        raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="No such tab")
+    return {"ok": True}
+
+
+@app.post("/api/profiles/{profile_id}/cdp/json/close/{target_id}")
+async def cdp_close(profile_id: str, target_id: str):
+    """Close a CDP target (tab)."""
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"http://127.0.0.1:{running.cdp_port}/json/close/{target_id}", timeout=5
+            )
+    except Exception as exc:
+        logger.error("CDP proxy: close failed for %s: %s", profile_id, exc)
+        raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="No such tab")
+    return {"ok": True}
+
+
+@app.post("/api/profiles/{profile_id}/cdp/json/new")
+async def cdp_new(profile_id: str, url: str = ""):
+    """Open a new tab, optionally at `url`. Proxies Chrome's PUT /json/new.
+
+    Chrome appends the raw query string as the target URL, so the URL is
+    re-quoted onto `/json/new?` rather than passed as a `url=` parameter.
+    """
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    target = f"http://127.0.0.1:{running.cdp_port}/json/new"
+    if url:
+        target += "?" + quote(url, safe="")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(target, timeout=5)
+    except Exception as exc:
+        logger.error("CDP proxy: new-tab failed for %s: %s", profile_id, exc)
+        raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"CDP new-tab rejected ({resp.status_code})")
+    return resp.json()
 
 
 async def _proxy_cdp_websocket(
