@@ -14,7 +14,7 @@ from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
 
-from .vnc_manager import VNCManager
+from . import database as db
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
 
@@ -150,8 +150,6 @@ CDP_PORT_RANGE = 100  # cycle through 5100-5199 to avoid TIME_WAIT collisions
 class RunningProfile:
     profile_id: str
     context: Any  # Playwright BrowserContext
-    display: int
-    ws_port: int
     cdp_port: int
 
 
@@ -159,7 +157,6 @@ class BrowserManager:
     def __init__(self):
         self.running: dict[str, RunningProfile] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
-        self.vnc = VNCManager()
         self._lock = asyncio.Lock()
         self._next_cdp_port = BASE_CDP_PORT
         self._auto_launch_task: asyncio.Task | None = None
@@ -173,14 +170,11 @@ class BrowserManager:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
 
-        display, ws_port = await self.vnc.allocate()
-
         try:
             cdp_port = self._allocate_cdp_port()
         except ValueError:
             async with self._lock:
                 self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
             raise
 
         # Clean stale Chromium lock files (left by previous container crashes)
@@ -193,17 +187,37 @@ class BrowserManager:
         _init_profile_defaults(user_data_dir)
 
         try:
-            # Start KasmVNC on the allocated display
-            await self.vnc.start_vnc(
-                display,
-                ws_port,
-                width=profile.get("screen_width", 1920),
-                height=profile.get("screen_height", 1080),
-            )
-
             # Build fingerprint args from profile settings
             extra_args = self._build_fingerprint_args(profile)
             extra_args += profile.get("launch_args") or []
+
+            # M1a: desktop is the default deployment target (sandbox ON).
+            # entrypoint.sh exports CBM_CONTAINER=1 for the Docker/container
+            # deployment, which requires --no-sandbox (no unprivileged user
+            # namespaces inside the container) — that path must keep the M0
+            # sandbox-OFF behavior below instead of the desktop default.
+            # Parsed as an explicit allow-list (not bool(str)) so a falsy-looking
+            # value like CBM_CONTAINER=0, or any other stray inherited value,
+            # can't silently select container mode and turn the sandbox off.
+            _container = os.environ.get("CBM_CONTAINER", "").strip().lower() in {"1", "true", "yes"}
+            _desktop = not _container
+            logger.info(
+                "launch mode=%s sandbox=%s",
+                "desktop" if _desktop else "container",
+                _desktop,
+            )
+
+            if _desktop:
+                # launch_args is user-supplied (PUT /api/profiles/{id}) and passed
+                # straight through to Chromium. Scrub --no-sandbox regardless of
+                # source so it can never reintroduce the sandbox-OFF RCE risk that
+                # chromium_sandbox=True below is meant to close. Container mode
+                # leaves launch_args untouched so an operator can still pass
+                # --no-sandbox explicitly.
+                extra_args = [
+                    a for a in extra_args
+                    if a != "--no-sandbox" and not a.startswith("--no-sandbox=")
+                ]
             extra_args.append(f"--remote-debugging-port={cdp_port}")
 
             # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
@@ -212,13 +226,39 @@ class BrowserManager:
             if proxy:
                 _validate_proxy(proxy)
 
-            # Launch CloakBrowser on that display
-            # DISPLAY is passed via env kwarg to avoid process-wide os.environ mutation
+            # chromium_sandbox is omitted entirely in container mode so
+            # Playwright's own --no-sandbox default applies (see (2) below).
+            _chromium_sandbox_kwargs = {"chromium_sandbox": True} if _desktop else {}
+
+            # Launch CloakBrowser
             context = await launch_persistent_context_async(
                 user_data_dir=profile["user_data_dir"],
                 headless=bool(profile.get("headless", False)),
                 proxy=proxy,
                 args=extra_args,
+                # --no-sandbox has TWO independent sources — both must be off
+                # on desktop (both left at their library defaults in container
+                # mode, which include --no-sandbox):
+                # (1) cloakbrowser's own get_default_stealth_args() unconditionally
+                #     includes it (config.py); stealth_args=False skips that whole
+                #     default set. Nothing else is lost: the other two defaults it
+                #     would have added (--fingerprint=<seed>, --fingerprint-platform=)
+                #     are already supplied above via _build_fingerprint_args(), which
+                #     the DB guarantees are always set (fingerprint_seed is NOT NULL,
+                #     platform defaults to the host OS). The --enable-automation /
+                #     --enable-unsafe-swiftshader suppression (ignore_default_args)
+                #     is applied unconditionally by launch_persistent_context_async
+                #     regardless of stealth_args, so navigator.webdriver stays masked.
+                # (2) Playwright's OWN Chromium launcher pushes --no-sandbox by
+                #     default unless chromium_sandbox=True is passed explicitly
+                #     (_innerDefaultArgs(): `if options.chromiumSandbox !== true`).
+                #     cloakbrowser never sets this, so it must be passed here —
+                #     it flows through launch_persistent_context_async(**kwargs)
+                #     straight to Playwright's launch_persistent_context() call.
+                # Verified empirically (M0 Task 6): stealth_args=False alone still
+                # left --no-sandbox on the Chromium command line via source (2).
+                stealth_args=(False if _desktop else True),
+                **_chromium_sandbox_kwargs,
                 timezone=profile.get("timezone") or None,
                 locale=profile.get("locale") or None,
                 humanize=bool(profile.get("humanize", False)),
@@ -230,7 +270,6 @@ class BrowserManager:
                     "width": profile.get("screen_width", 1920),
                     "height": profile.get("screen_height", 1080) - 133,
                 },
-                env={**os.environ, "DISPLAY": f":{display}"},
             )
 
             # Inject clipboard listener: captures copied text on every page
@@ -256,15 +295,17 @@ class BrowserManager:
                 except Exception as exc:
                     logger.debug("Clipboard init failed on existing page: %s", exc)
 
+            # Fire-and-forget: raising the window is best-effort UX and must not
+            # sit on the launch path (mirrors the context.on("close") handler below).
+            asyncio.ensure_future(self._raise_window(context, profile_id))
+
             running = RunningProfile(
                 profile_id=profile_id,
                 context=context,
-                display=display,
-                ws_port=ws_port,
                 cdp_port=cdp_port,
             )
 
-            # Auto-cleanup if browser crashes or user closes Chrome via VNC
+            # Auto-cleanup if browser crashes or user closes Chrome
             context.on("close", lambda: asyncio.ensure_future(
                 self._on_browser_closed(profile_id)
             ))
@@ -274,8 +315,8 @@ class BrowserManager:
                 self._launching.discard(profile_id)
 
             logger.info(
-                "Launched profile %s on display :%d (ws_port=%d, cdp_port=%d)",
-                profile_id, display, ws_port, cdp_port,
+                "Launched profile %s (cdp_port=%d)",
+                profile_id, cdp_port,
             )
 
             return running
@@ -283,17 +324,25 @@ class BrowserManager:
         except BaseException:
             async with self._lock:
                 self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
             raise
 
+    async def _raise_window(self, context, profile_id: str) -> None:
+        """Bring the profile's first page/window to the foreground so the native
+        Chromium window isn't hidden behind the app window. Guarded — a failure
+        here must never fail the launch (harmless no-op in the container)."""
+        try:
+            if context.pages:
+                await context.pages[0].bring_to_front()
+        except Exception as exc:
+            logger.warning("bring_to_front failed for %s: %s", profile_id, exc)
+
     async def _on_browser_closed(self, profile_id: str):
-        """Called when browser exits (crash, user closed via VNC, or stop())."""
+        """Called when browser exits (crash or stop())."""
         async with self._lock:
             running = self.running.pop(profile_id, None)
 
         if running:
             logger.info("Browser closed for profile %s, cleaning up", profile_id)
-            await self.vnc.stop_vnc(running.display)
 
     async def stop(self, profile_id: str):
         """Stop a running browser instance."""
@@ -311,19 +360,15 @@ class BrowserManager:
         except Exception as exc:
             logger.warning("Error closing context for %s: %s", profile_id, exc)
 
-        await self.vnc.stop_vnc(running.display)
-
     def get_status(self, profile_id: str) -> dict[str, Any]:
         """Get running status for a profile."""
         running = self.running.get(profile_id)
         if running:
             return {
                 "status": "running",
-                "vnc_ws_port": running.ws_port,
-                "display": f":{running.display}",
                 "cdp_url": f"/api/profiles/{profile_id}/cdp",
             }
-        return {"status": "stopped", "vnc_ws_port": None, "display": None, "cdp_url": None}
+        return {"status": "stopped", "cdp_url": None}
 
     async def cleanup_all(self):
         """Stop all running profiles. Called on shutdown."""
@@ -333,16 +378,40 @@ class BrowserManager:
         for pid in profile_ids:
             await self.stop(pid)
 
-        await self.vnc.cleanup_all()
-
     async def cleanup_stale(self):
-        """Kill orphan processes from previous container runs."""
-        await self.vnc.cleanup_stale()
+        """Kill orphaned Chromium from a prior run + delete stale singleton locks.
+        Identifies OUR processes ONLY by a --user-data-dir= argument pointing at our
+        profiles dir — NEVER by process name (the binary is named 'Chromium') and
+        NEVER by a bare substring match anywhere in the command line.
+
+        profiles_root is resolved, but database.py writes UNresolved
+        --user-data-dir= values (str(DATA_DIR / "profiles" / id)). If DATA_DIR is
+        (or contains) a symlink, an unresolved arg would never match a resolved
+        root, so the arg is realpath'd here too before comparing."""
+        import psutil
+        profiles_root = str((db.DATA_DIR / "profiles").resolve())
+        marker = "--user-data-dir="
+        for proc in psutil.process_iter(["cmdline"]):
+            try:
+                if proc.pid == os.getpid():
+                    continue
+                cmdline = proc.info.get("cmdline") or []
+                if any(
+                    a.startswith(marker) and os.path.realpath(a[len(marker):]).startswith(profiles_root)
+                    for a in cmdline
+                ):
+                    logger.warning("Killing orphan Chromium pid=%s cmdline=%s", proc.pid, cmdline)
+                    proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        for lock in Path(profiles_root).glob("*/Singleton*"):
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Failed to unlink stale lock %s", lock)
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""
-        from . import database as db
-
         profiles = db.list_profiles()
         auto_profiles = [p for p in profiles if p.get("auto_launch")]
         if not auto_profiles:
@@ -350,7 +419,8 @@ class BrowserManager:
             return
 
         logger.info("Auto-launching %d profile(s)...", len(auto_profiles))
-        for profile in auto_profiles:
+        last = len(auto_profiles) - 1
+        for i, profile in enumerate(auto_profiles):
             try:
                 await asyncio.wait_for(self.launch(profile), timeout=60)
                 logger.info("Auto-launched profile %s (%s)", profile["name"], profile["id"])
@@ -359,6 +429,10 @@ class BrowserManager:
                     "Auto-launch failed for profile %s (%s): %s",
                     profile["name"], profile["id"], exc,
                 )
+            if i < last:
+                # Stagger launches so N first-run geoip downloads + N windows
+                # don't erupt simultaneously.
+                await asyncio.sleep(1.5)
         logger.info("Auto-launch complete: %d running", len(self.running))
 
     def _allocate_cdp_port(self) -> int:
@@ -388,10 +462,14 @@ class BrowserManager:
         if seed is not None:
             args.append(f"--fingerprint={seed}")
 
-        p = profile.get("platform")
-        if p:
-            # Map our "macos" to binary's "macos"
-            args.append(f"--fingerprint-platform={p}")
+        # Always emit a platform spoof, even if the profile's platform is
+        # falsy (None/""). Previously this was guarded by `if p:`, relying on
+        # cloakbrowser's own stealth_args default to inject a fallback
+        # --fingerprint-platform when we didn't. Now that launch() passes
+        # stealth_args=False, that fallback no longer exists — an unset
+        # platform would silently launch with NO platform spoof at all.
+        p = profile.get("platform") or db.host_platform()
+        args.append(f"--fingerprint-platform={p}")
 
         vendor = profile.get("gpu_vendor")
         if vendor:

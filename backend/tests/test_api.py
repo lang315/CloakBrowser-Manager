@@ -103,8 +103,6 @@ def test_delete_profile_stops_running(app_client: TestClient):
 
     # Inject mock running profile
     mock_running = MagicMock(spec=RunningProfile)
-    mock_running.display = 100
-    mock_running.ws_port = 6100
     mock_running.cdp_port = 5100
     main.browser_mgr.running[pid] = mock_running
     main.browser_mgr.stop = AsyncMock()
@@ -268,7 +266,6 @@ def test_set_clipboard_success(app_client: TestClient):
 
     # Inject mock running profile
     mock_running = MagicMock(spec=RunningProfile)
-    mock_running.display = 100
     mock_running.cdp_port = 5100
     main.browser_mgr.running[pid] = mock_running
 
@@ -302,7 +299,6 @@ def test_get_clipboard_from_page(app_client: TestClient):
     mock_context.pages = [mock_page]
 
     mock_running = MagicMock(spec=RunningProfile)
-    mock_running.display = 100
     mock_running.cdp_port = 5100
     mock_running.context = mock_context
     main.browser_mgr.running[pid] = mock_running
@@ -351,8 +347,6 @@ def test_running_profile_has_cdp_url(app_client: TestClient):
     pid = create.json()["id"]
 
     mock_running = MagicMock(spec=RunningProfile)
-    mock_running.display = 100
-    mock_running.ws_port = 6100
     mock_running.cdp_port = 5100
     mock_running.profile_id = pid
     main.browser_mgr.running[pid] = mock_running
@@ -382,8 +376,6 @@ def test_cdp_json_list_not_running(app_client: TestClient):
 def _mock_running_profile(pid: str) -> MagicMock:
     """Create a mock RunningProfile and register it in browser_mgr."""
     mock = MagicMock(spec=RunningProfile)
-    mock.display = 100
-    mock.ws_port = 6100
     mock.cdp_port = 5100
     mock.profile_id = pid
     main.browser_mgr.running[pid] = mock
@@ -411,7 +403,7 @@ def test_cdp_json_version_rewrites_ws_url(app_client: TestClient):
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["webSocketDebuggerUrl"] == f"ws://testserver/api/profiles/{pid}/cdp"
+    assert data["webSocketDebuggerUrl"] == f"ws://localhost/api/profiles/{pid}/cdp"
     assert data["Browser"] == "Chrome/145.0.0.0"
     main.browser_mgr.running.pop(pid, None)
 
@@ -470,7 +462,7 @@ def test_cdp_json_list_rewrites_page_urls(app_client: TestClient):
     assert resp.status_code == 200
     data = resp.json()
     assert data[0]["webSocketDebuggerUrl"] == (
-        f"ws://testserver/api/profiles/{pid}/cdp/devtools/page/DEADBEEF"
+        f"ws://localhost/api/profiles/{pid}/cdp/devtools/page/DEADBEEF"
     )
     assert "webSocketDebuggerUrl" not in data[1]
     main.browser_mgr.running.pop(pid, None)
@@ -490,6 +482,110 @@ def test_cdp_json_version_chrome_unreachable(app_client: TestClient):
     with patch("httpx.AsyncClient", return_value=mock_client):
         resp = app_client.get(f"/api/profiles/{pid}/cdp/json/version")
 
+    assert resp.status_code == 502
+    main.browser_mgr.running.pop(pid, None)
+
+
+# ── CDP control endpoints (M1c) ──────────────────────────────────────────────
+
+
+def _mock_httpx(chrome_response):
+    """Return a patched httpx.AsyncClient whose get/put yield chrome_response."""
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=chrome_response)
+    mock_client.put = AsyncMock(return_value=chrome_response)
+    return mock_client
+
+
+def test_cdp_activate_not_running(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/cdp/json/activate/ABC")
+    assert resp.status_code == 404
+
+
+def test_cdp_activate_success(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "Act"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    chrome_response = MagicMock()
+    chrome_response.status_code = 200
+    with patch("httpx.AsyncClient", return_value=_mock_httpx(chrome_response)):
+        resp = app_client.post(f"/api/profiles/{pid}/cdp/json/activate/ABC123")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_activate_unknown_target_404(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "Act404"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    chrome_response = MagicMock()
+    chrome_response.status_code = 404
+    with patch("httpx.AsyncClient", return_value=_mock_httpx(chrome_response)):
+        resp = app_client.post(f"/api/profiles/{pid}/cdp/json/activate/NOPE")
+    assert resp.status_code == 404
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_activate_chrome_unreachable_502(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "ActDown"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=ConnectionError("refused"))
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.post(f"/api/profiles/{pid}/cdp/json/activate/ABC")
+    assert resp.status_code == 502
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_close_success(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "Close"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    chrome_response = MagicMock()
+    chrome_response.status_code = 200
+    with patch("httpx.AsyncClient", return_value=_mock_httpx(chrome_response)):
+        resp = app_client.post(f"/api/profiles/{pid}/cdp/json/close/ABC123")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_new_returns_target(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "NewTab"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    chrome_response = MagicMock()
+    chrome_response.status_code = 200
+    chrome_response.json.return_value = {"id": "T2", "type": "page", "url": "https://example.com"}
+    mock_client = _mock_httpx(chrome_response)
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        resp = app_client.post(f"/api/profiles/{pid}/cdp/json/new?url=https://example.com")
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "https://example.com"
+    assert mock_client.put.await_args.args[0] == "http://127.0.0.1:5100/json/new?https%3A%2F%2Fexample.com"
+    main.browser_mgr.running.pop(pid, None)
+
+
+def test_cdp_new_not_running(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/cdp/json/new")
+    assert resp.status_code == 404
+
+
+def test_cdp_new_bad_json_returns_502(app_client: TestClient):
+    create = app_client.post("/api/profiles", json={"name": "NewBad"})
+    pid = create.json()["id"]
+    _mock_running_profile(pid)
+    chrome_response = MagicMock()
+    chrome_response.status_code = 200
+    chrome_response.json.side_effect = ValueError("not json")
+    with patch("httpx.AsyncClient", return_value=_mock_httpx(chrome_response)):
+        resp = app_client.post(f"/api/profiles/{pid}/cdp/json/new?url=https://x.com")
     assert resp.status_code == 502
     main.browser_mgr.running.pop(pid, None)
 
@@ -539,7 +635,7 @@ def test_ws_allows_same_origin(app_client: TestClient):
     try:
         with app_client.websocket_connect(
             f"/api/profiles/{pid}/vnc",
-            headers={"origin": "http://testserver"},
+            headers={"origin": "http://localhost"},
         ) as ws:
             pass  # connection accepted = Origin check passed
     except Exception as exc:

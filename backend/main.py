@@ -11,11 +11,10 @@ import hmac
 import logging
 import os
 import struct
-import shutil
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -25,6 +24,7 @@ import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import database as db
+from . import single_instance
 from .browser_manager import BrowserManager
 from .models import (
     ClipboardRequest,
@@ -53,6 +53,14 @@ AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 # Paths that bypass authentication even when AUTH_TOKEN is set
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status"})
 
+# M0 loopback cookie auth (spec §4.3): the exact Host-allowlist is always
+# enforced; the cbm_ui cookie is required for /api/* only once CBM_UI_SECRET
+# is configured — the desktop entrypoint always sets it (desktop/app_entry.py),
+# tests that don't set it keep today's cookie-less behavior. Read live from
+# os.environ (not cached at import time) so tests can scope it per-test.
+_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_CBM_COOKIE_EXEMPT = frozenset({"/api/status"})
+
 
 def _check_auth(scope: Scope) -> bool:
     """Check if the request has a valid auth token (header or cookie)."""
@@ -78,6 +86,54 @@ def _check_auth(scope: Scope) -> bool:
             break
 
     return False
+
+
+def _request_hostname(scope: Scope) -> str | None:
+    """Extract the bare hostname from the ASGI Host header (drops port/brackets)."""
+    for key, val in scope.get("headers", []):
+        if key == b"host":
+            try:
+                return urlparse(f"//{val.decode('latin-1')}").hostname
+            except ValueError:
+                return None
+    return None
+
+
+def _check_cbm_cookie(scope: Scope, secret: str) -> bool:
+    """Validate the `cbm_ui` loopback UI cookie against CBM_UI_SECRET.
+
+    Reads the raw ASGI headers directly (like `_check_auth` above) instead of
+    constructing a `starlette.requests.Request`, whose `__init__` asserts
+    `scope["type"] == "http"` and raises on WebSocket scopes.
+    """
+    for key, val in scope.get("headers", []):
+        if key == b"cookie":
+            cookies = SimpleCookie()
+            cookies.load(val.decode())
+            if "cbm_ui" in cookies:
+                cookie_val = cookies["cbm_ui"].value
+                if cookie_val and hmac.compare_digest(cookie_val, secret):
+                    return True
+            break
+    return False
+
+
+def _cbm_set_cookie_header(secret: str) -> tuple[bytes, bytes]:
+    """Build the Set-Cookie ASGI header tuple for the loopback UI cookie."""
+    response = Response()
+    response.set_cookie(
+        key="cbm_ui", value=secret, httponly=True, samesite="strict", secure=False, path="/",
+    )
+    return next(h for h in response.raw_headers if h[0] == b"set-cookie")
+
+
+def _with_set_cookie(send: Send, header: tuple[bytes, bytes]) -> Send:
+    """Wrap an ASGI `send` to inject a Set-Cookie header into the response start."""
+    async def wrapped(message):
+        if message["type"] == "http.response.start":
+            message = {**message, "headers": [*message.get("headers", []), header]}
+        await send(message)
+    return wrapped
 
 
 def _is_https(request: Request) -> bool:
@@ -137,7 +193,8 @@ async def _check_websocket_origin(websocket: WebSocket) -> bool:
 
 
 class AuthMiddleware:
-    """Raw ASGI middleware for optional token auth.
+    """Raw ASGI middleware: exact Host-allowlist + loopback cookie auth (M0),
+    layered on top of the optional legacy AUTH_TOKEN bearer/cookie auth.
 
     Uses raw ASGI instead of BaseHTTPMiddleware because the latter
     breaks WebSocket routes (wraps request body, preventing WS upgrade).
@@ -147,34 +204,58 @@ class AuthMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        # Pass through if auth disabled, or non-HTTP/WS scope (e.g. lifespan)
-        if not AUTH_TOKEN or scope["type"] not in ("http", "websocket"):
+        # Non-HTTP/WS scopes (e.g. lifespan) bypass all checks below.
+        if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
+            return
+
+        # (a) Exact Host-allowlist — always enforced, HTTP and WS alike.
+        if _request_hostname(scope) not in _ALLOWED_HOSTS:
+            await self._reject(scope, receive, send, 403, 4403, "Forbidden host")
             return
 
         path = scope["path"]
+        cbm_secret = os.environ.get("CBM_UI_SECRET") or None
 
-        # Skip auth for exempt endpoints and non-API paths (static frontend)
-        if path in _AUTH_EXEMPT or not path.startswith("/api/"):
-            await self.app(scope, receive, send)
-            return
+        # (c) /api/* (except /api/status) requires the cbm_ui cookie.
+        if cbm_secret and path.startswith("/api/") and path not in _CBM_COOKIE_EXEMPT:
+            if not _check_cbm_cookie(scope, cbm_secret):
+                await self._reject(scope, receive, send, 401, 4401, "Unauthorized")
+                return
 
-        if _check_auth(scope):
-            await self.app(scope, receive, send)
-            return
+        # Legacy optional AUTH_TOKEN (Bearer header / auth_token cookie).
+        if AUTH_TOKEN and path.startswith("/api/") and path not in _AUTH_EXEMPT:
+            if not _check_auth(scope):
+                await self._reject(scope, receive, send, 401, 4401, "Unauthorized")
+                return
 
-        # Reject — unauthenticated
+        # (b) SPA index bootstrap: stamp the cbm_ui cookie so the webview's
+        # subsequent /api/* requests carry it.
+        if cbm_secret and scope["type"] == "http" and scope.get("method") == "GET" and path == "/":
+            send = _with_set_cookie(send, _cbm_set_cookie_header(cbm_secret))
+
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _reject(
+        scope: Scope, receive: Receive, send: Send,
+        status_code: int, ws_code: int, detail: str,
+    ) -> None:
         if scope["type"] == "websocket":
             # ASGI requires receiving websocket.connect before sending close
             await receive()
-            await send({"type": "websocket.close", "code": 4401, "reason": "Unauthorized"})
+            await send({"type": "websocket.close", "code": ws_code, "reason": detail})
         else:
-            response = JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            response = JSONResponse({"detail": detail}, status_code=status_code)
             await response(scope, receive, send)
 
 
 # Singleton browser manager
 browser_mgr = BrowserManager()
+
+# Held for the process lifetime once acquired in lifespan() — prevents two
+# CloakBrowser Manager instances from running against the same profiles.db.
+_instance_lock: object | None = None
 
 # Frontend build directory (React production build)
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
@@ -374,6 +455,12 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _instance_lock
+    _instance_lock = single_instance.acquire(db.DATA_DIR / "app.lock")
+    if _instance_lock is None:
+        logger.error("Another CloakBrowser Manager instance is already running.")
+        raise SystemExit(1)
+
     db.init_db()
     await browser_mgr.cleanup_stale()
     browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
@@ -384,6 +471,9 @@ async def lifespan(app: FastAPI):
         browser_mgr._auto_launch_task.cancel()
         await asyncio.gather(browser_mgr._auto_launch_task, return_exceptions=True)
     await browser_mgr.cleanup_all()
+    if _instance_lock is not None:
+        _instance_lock.close()
+        _instance_lock = None
 
 
 app = FastAPI(title="CloakBrowser Manager", lifespan=lifespan)
@@ -442,8 +532,8 @@ async def list_profiles():
     for p in profiles:
         status = browser_mgr.get_status(p["id"])
         p["status"] = status["status"]
-        p["vnc_ws_port"] = status["vnc_ws_port"]
         p["cdp_url"] = status["cdp_url"]
+        p["platform_detectable"] = p["platform"] != db.host_platform()
         p["tags"] = [TagResponse(**t) for t in p.get("tags", [])]
         result.append(ProfileResponse(**p))
     return result
@@ -460,8 +550,8 @@ async def create_profile(req: ProfileCreate):
     profile = db.create_profile(**data)
     status = browser_mgr.get_status(profile["id"])
     profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
     profile["cdp_url"] = status["cdp_url"]
+    profile["platform_detectable"] = profile["platform"] != db.host_platform()
     profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
     return ProfileResponse(**profile)
 
@@ -473,8 +563,8 @@ async def get_profile(profile_id: str):
         raise HTTPException(status_code=404, detail="Profile not found")
     status = browser_mgr.get_status(profile_id)
     profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
     profile["cdp_url"] = status["cdp_url"]
+    profile["platform_detectable"] = profile["platform"] != db.host_platform()
     profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
     return ProfileResponse(**profile)
 
@@ -491,10 +581,27 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
         raise HTTPException(status_code=404, detail="Profile not found")
     status = browser_mgr.get_status(profile_id)
     profile["status"] = status["status"]
-    profile["vnc_ws_port"] = status["vnc_ws_port"]
     profile["cdp_url"] = status["cdp_url"]
+    profile["platform_detectable"] = profile["platform"] != db.host_platform()
     profile["tags"] = [TagResponse(**t) for t in profile.get("tags", [])]
     return ProfileResponse(**profile)
+
+
+def _rmtree_with_retry(path, attempts: int = 5, delay: float = 0.2) -> None:
+    """Remove a profile dir, retrying to survive Chromium's async lock release on Windows."""
+    import shutil, time
+    p = Path(path)
+    if not p.exists():
+        return
+    last: Exception | None = None
+    for _ in range(attempts):
+        try:
+            shutil.rmtree(p)
+            return
+        except OSError as exc:
+            last = exc
+            time.sleep(delay)
+    raise last  # surface it — do not silently leave an orphan
 
 
 @app.delete("/api/profiles/{profile_id}")
@@ -512,9 +619,18 @@ async def delete_profile(profile_id: str):
     # DB first — if this fails, filesystem is untouched
     db.delete_profile(profile_id)
 
-    # Then clean up disk
-    if user_data_dir.exists():
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+    # Then clean up disk, retrying to survive Chromium's async lock release
+    try:
+        _rmtree_with_retry(user_data_dir)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Profile record deleted, but failed to remove its data directory "
+                f"({user_data_dir}) after repeated retries: {exc}. "
+                "The directory may need manual removal once the process holding it exits."
+            ),
+        )
 
     return {"ok": True}
 
@@ -531,7 +647,7 @@ async def launch_profile(profile_id: str):
         raise HTTPException(status_code=409, detail="Profile is already running")
 
     try:
-        running = await browser_mgr.launch(profile)
+        await browser_mgr.launch(profile)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -541,8 +657,6 @@ async def launch_profile(profile_id: str):
     return LaunchResponse(
         profile_id=profile_id,
         status="running",
-        vnc_ws_port=running.ws_port,
-        display=f":{running.display}",
         cdp_url=f"/api/profiles/{profile_id}/cdp",
     )
 
@@ -583,46 +697,42 @@ async def get_system_status():
 
 _CLIPBOARD_MAX_READ = 1_048_576  # 1MB cap on GET response
 
-# Track xclip processes per display so we can kill the old one before spawning new
-_xclip_procs: dict[int, asyncio.subprocess.Process] = {}
+# Track xclip processes per profile so we can kill the old one before spawning new
+_xclip_procs: dict[str, asyncio.subprocess.Process] = {}
 
 
 @app.post("/api/profiles/{profile_id}/clipboard")
 async def set_clipboard(profile_id: str, body: ClipboardRequest):
-    """Push text into the VNC session's X clipboard via xclip."""
+    """Push text into the desktop clipboard via xclip."""
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
 
-    import os
-
-    # Kill previous xclip for this display (it stays alive to serve paste)
-    old = _xclip_procs.pop(running.display, None)
+    # Kill previous xclip for this profile (it stays alive to serve paste)
+    old = _xclip_procs.pop(profile_id, None)
     if old and old.returncode is None:
         old.kill()
         await old.wait()
 
-    env = {**os.environ, "DISPLAY": f":{running.display}"}
     proc = await asyncio.create_subprocess_exec(
         "xclip", "-selection", "clipboard",
         stdin=asyncio.subprocess.PIPE,
-        env=env,
     )
     # xclip reads stdin then stays alive to serve paste requests.
     proc.stdin.write(body.text.encode())  # type: ignore[union-attr]
     await proc.stdin.drain()  # type: ignore[union-attr]
     proc.stdin.close()  # type: ignore[union-attr]
 
-    _xclip_procs[running.display] = proc
+    _xclip_procs[profile_id] = proc
 
     return {"ok": True}
 
 
 @app.get("/api/profiles/{profile_id}/clipboard")
 async def get_clipboard(profile_id: str):
-    """Read the VNC session's clipboard.
+    """Read the browser's clipboard.
 
-    Chrome doesn't write to X11 clipboard under KasmVNC, so xclip can't read it.
+    Chrome doesn't write to the X11 clipboard, so xclip can't read it.
     Instead, read via Playwright's CDP connection to Chrome (navigator.clipboard.readText).
     Falls back to xclip for non-Chrome clipboard owners.
     """
@@ -631,9 +741,9 @@ async def get_clipboard(profile_id: str):
         raise HTTPException(status_code=404, detail="Profile not running")
 
     # Read Chrome's current text selection via Playwright.
-    # Chrome's native copy (via VNC Ctrl+C) doesn't write to X11 clipboard
-    # and doesn't fire DOM events, so we read the visible selection instead.
-    # The init script also captures copy events when they do fire.
+    # Chrome's native copy doesn't write to the X11 clipboard and doesn't fire
+    # DOM events, so we read the visible selection instead. The init script
+    # also captures copy events when they do fire.
     # Check all pages — user may have copied in any tab
     try:
         for page in running.context.pages:
@@ -648,14 +758,10 @@ async def get_clipboard(profile_id: str):
         logger.debug("Playwright clipboard read failed: %s", exc)
 
     # Fallback: xclip for non-Chrome clipboard owners
-    import os
-
-    env = {**os.environ, "DISPLAY": f":{running.display}"}
     proc = await asyncio.create_subprocess_exec(
         "xclip", "-selection", "clipboard", "-o",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=env,
     )
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
@@ -676,7 +782,11 @@ async def get_clipboard(profile_id: str):
 
 @app.websocket("/api/profiles/{profile_id}/vnc")
 async def vnc_proxy(websocket: WebSocket, profile_id: str):
-    """Proxy WebSocket frames between the frontend and a profile's KasmVNC."""
+    """Proxy WebSocket frames between the frontend and a profile's KasmVNC.
+
+    VNC was removed from the launch path (desktop packaging, M0) — profiles no
+    longer start a KasmVNC server, so there is nothing left to proxy to.
+    """
     if not await _check_websocket_origin(websocket):
         return
 
@@ -685,156 +795,8 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
         await websocket.close(code=4004, reason="Profile not running")
         return
 
-    # Accept with client's requested subprotocol (if any) — RFC 6455 requires
-    # the server must not respond with a subprotocol the client didn't request.
-    requested = websocket.scope.get("subprotocols", [])
-    subprotocol = "binary" if "binary" in requested else None
-    await websocket.accept(subprotocol=subprotocol)
-
-    import websockets
-
-    vnc_url = f"ws://127.0.0.1:{running.ws_port}/websockify"
-
-    try:
-        async with websockets.connect(
-            vnc_url,
-            subprotocols=["binary"],
-            origin=f"http://127.0.0.1:{running.ws_port}",
-            max_size=None,  # VNC frames can be large (1920x1080 framebuffer)
-            ping_interval=None,  # KasmVNC doesn't respond to WS pings
-            ping_timeout=None,
-            compression=None,  # KasmVNC can't handle permessage-deflate
-        ) as vnc_ws:
-            logger.info(
-                "VNC proxy: connected to KasmVNC for %s (subprotocol=%s)",
-                profile_id, vnc_ws.subprotocol,
-            )
-
-            # noVNC v1.4 sends extension message types (150=ContinuousUpdates,
-            # 248=QEMUKey, etc.) that KasmVNC 1.3.3 doesn't support, causing
-            # "unknown message type" → disconnect.
-            #
-            # noVNC batches multiple RFB messages into a single WebSocket frame,
-            # so we must parse the RFB stream to find message boundaries and strip
-            # unsupported types before forwarding. Standard client→server types
-            # have known fixed sizes (except SetEncodings and ClientCutText which
-            # encode their length).
-
-            async def client_to_vnc():
-                count = 0
-                handshake = 0  # first 3 messages are RFB handshake
-                dropped = 0
-                try:
-                    while True:
-                        msg = await websocket.receive()
-                        msg_type = msg.get("type", "")
-                        if msg_type == "websocket.disconnect":
-                            logger.info("VNC proxy [c->v]: client disconnect (code=%s) after %d msgs (%d dropped)", msg.get("code"), count, dropped)
-                            break
-                        if "bytes" in msg and msg["bytes"]:
-                            count += 1
-                            data = msg["bytes"]
-                            handshake += 1
-
-                            # First 3 messages are RFB handshake — forward as-is
-                            if handshake <= 3:
-                                logger.debug("VNC handshake #%d: %d bytes hex=%s", handshake, len(data), data[:20].hex())
-                                await vnc_ws.send(data)
-                                continue
-
-                            # Parse RFB messages and strip unsupported types
-                            filtered = _filter_rfb_client_messages(data)
-                            if filtered:
-                                # Safety: verify first byte is a valid RFB client type
-                                if filtered[0] not in _RFB_MSG_SIZE:
-                                    logger.error("RFB SAFETY: refusing to send data with invalid first byte=%d hex=%s",
-                                                 filtered[0], filtered[:20].hex())
-                                    dropped += 1
-                                    continue
-                                logger.debug("VNC send: %d bytes first_type=%d hex=%s", len(filtered), filtered[0], filtered[:100].hex())
-                                await vnc_ws.send(filtered)
-                            else:
-                                dropped += 1
-
-                        elif "text" in msg and msg["text"]:
-                            # noVNC only sends binary frames — text frames are unexpected
-                            # and would bypass the RFB filter, so drop them.
-                            count += 1
-                            logger.warning("VNC proxy [c->v]: DROPPING text frame len=%d (noVNC should only send binary)", len(msg["text"]))
-                            dropped += 1
-                        else:
-                            logger.warning("VNC proxy [c->v]: unhandled msg keys=%s type=%s", list(msg.keys()), msg_type)
-                except WebSocketDisconnect as exc:
-                    logger.info("VNC proxy [c->v]: WebSocketDisconnect code=%s after %d msgs (%d dropped)", exc.code, count, dropped)
-                except Exception as exc:
-                    logger.warning("VNC proxy [c->v]: %s: %s (after %d msgs)", type(exc).__name__, exc, count)
-
-            async def vnc_to_client():
-                count = 0
-                try:
-                    async for msg in vnc_ws:
-                        count += 1
-                        if isinstance(msg, bytes) and len(msg) > 0:
-                            msg_type = msg[0]
-                            if msg_type == 180:
-                                # KasmVNC BinaryClipboard → convert to standard
-                                # ServerCutText (type 3) so noVNC can handle it
-                                text = _parse_kasmvnc_clipboard(msg)
-                                if text:
-                                    logger.info("VNC proxy [v->c]: clipboard %d chars", len(text))
-                                    await websocket.send_bytes(_build_server_cut_text(text))
-                                else:
-                                    logger.info("VNC proxy [v->c]: dropped type 180 (no text/plain)")
-                                continue
-                            await websocket.send_bytes(msg)
-                        elif isinstance(msg, bytes):
-                            await websocket.send_bytes(msg)
-                        else:
-                            await websocket.send_text(msg)
-                    logger.info("VNC proxy [v->c]: KasmVNC stream ended after %d msgs (close_code=%s)", count, vnc_ws.close_code)
-                except WebSocketDisconnect as exc:
-                    logger.info("VNC proxy [v->c]: client disconnect code=%s after %d msgs", exc.code, count)
-                except Exception as exc:
-                    logger.warning("VNC proxy [v->c]: %s: %s (after %d msgs)", type(exc).__name__, exc, count)
-
-            c2v = asyncio.create_task(client_to_vnc(), name="c2v")
-            v2c = asyncio.create_task(vnc_to_client(), name="v2c")
-
-            done, pending = await asyncio.wait(
-                [c2v, v2c],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            finished = [t.get_name() for t in done]
-            still_running = [t.get_name() for t in pending]
-
-            # Check if Xvnc is still alive
-            vnc_instance = browser_mgr.vnc._allocated.get(running.display)
-            xvnc_alive = vnc_instance and vnc_instance.process and vnc_instance.process.poll() is None
-            logger.info(
-                "VNC proxy: finished=%s pending=%s xvnc_alive=%s display=:%d for %s",
-                finished, still_running, xvnc_alive, running.display, profile_id,
-            )
-
-            # Dump Xvnc log on disconnect
-            import os
-            xvnc_log = f"/tmp/xvnc-{running.display}.log"
-            if os.path.exists(xvnc_log):
-                with open(xvnc_log) as f:
-                    log_content = f.read()
-                if log_content.strip():
-                    for line in log_content.strip().split("\n")[-20:]:
-                        logger.info("Xvnc[:%d] %s", running.display, line)
-
-            for task in pending:
-                task.cancel()
-
-    except Exception as exc:
-        logger.error("VNC proxy connect error for %s: %s: %s", profile_id, type(exc).__name__, exc)
-    finally:
-        try:
-            await websocket.close()
-        except Exception as exc:
-            logger.debug("VNC proxy: websocket.close() failed: %s", exc)
+    await websocket.accept()
+    await websocket.close(code=4006, reason="VNC not available")
 
 
 # ── CDP WebSocket Proxy ──────────────────────────────────────────────────────
@@ -909,6 +871,60 @@ async def cdp_json_list(profile_id: str, request: Request):
                 f"{ws_scheme}://{host}/api/profiles/{profile_id}/cdp/devtools/{ws_path}"
             )
     return data
+
+
+async def _cdp_http(profile_id: str, path: str, method: str = "GET") -> httpx.Response:
+    """Proxy one HTTP request to a running profile's Chrome DevTools endpoint.
+    404 if the profile isn't running, 502 if Chrome is unreachable. Callers own
+    the response handling (status checks, JSON decode, WS-URL rewrite)."""
+    running = browser_mgr.running.get(profile_id)
+    if not running:
+        raise HTTPException(status_code=404, detail="Profile not running")
+    try:
+        async with httpx.AsyncClient() as client:
+            return await getattr(client, method.lower())(
+                f"http://127.0.0.1:{running.cdp_port}{path}", timeout=5
+            )
+    except Exception as exc:
+        logger.error("CDP proxy: %s %s failed for %s: %s", method, path, profile_id, exc)
+        raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
+
+
+async def _cdp_target_action(profile_id: str, target_id: str, action: str) -> dict:
+    """Shared body for activate/close: proxy Chrome's GET /json/<action>/<id>."""
+    resp = await _cdp_http(profile_id, f"/json/{action}/{target_id}")
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="No such tab")
+    return {"ok": True}
+
+
+@app.post("/api/profiles/{profile_id}/cdp/json/activate/{target_id}")
+async def cdp_activate(profile_id: str, target_id: str):
+    """Activate (raise + focus) a CDP target. Chrome raises the OS window."""
+    return await _cdp_target_action(profile_id, target_id, "activate")
+
+
+@app.post("/api/profiles/{profile_id}/cdp/json/close/{target_id}")
+async def cdp_close(profile_id: str, target_id: str):
+    """Close a CDP target (tab)."""
+    return await _cdp_target_action(profile_id, target_id, "close")
+
+
+@app.post("/api/profiles/{profile_id}/cdp/json/new")
+async def cdp_new(profile_id: str, url: str = ""):
+    """Open a new tab, optionally at `url`. Proxies Chrome's PUT /json/new.
+
+    Chrome appends the raw query string as the target URL, so the URL is
+    re-quoted onto `/json/new?` rather than passed as a `url=` parameter.
+    """
+    path = "/json/new" + ("?" + quote(url, safe="") if url else "")
+    resp = await _cdp_http(profile_id, path, "PUT")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"CDP new-tab rejected ({resp.status_code})")
+    try:
+        return resp.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
 
 
 async def _proxy_cdp_websocket(

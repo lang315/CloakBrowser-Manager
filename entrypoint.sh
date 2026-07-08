@@ -23,4 +23,5 @@ cd /app
 echo ""
 echo "  CloakBrowser Manager running at http://localhost:8080"
 echo ""
+export CBM_CONTAINER=1
 exec uvicorn backend.main:app --host 0.0.0.0 --port 8080 --log-level warning

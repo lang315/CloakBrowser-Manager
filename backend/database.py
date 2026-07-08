@@ -4,14 +4,26 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import random
 import sqlite3
+import sys
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-DATA_DIR = Path("/data")
+
+def _default_data_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "CloakBrowser Manager"
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home())
+        return Path(base) / "CloakBrowser Manager"
+    return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "CloakBrowser Manager"
+
+
+DATA_DIR = Path(os.environ.get("CBM_DATA_DIR") or _default_data_dir())
 DB_PATH = DATA_DIR / "profiles.db"
 
 
@@ -84,6 +96,10 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def host_platform() -> str:
+    return {"darwin": "macos", "win32": "windows"}.get(sys.platform, "linux")
+
+
 def create_profile(
     name: str,
     fingerprint_seed: int | None = None,
@@ -109,7 +125,7 @@ def create_profile(
                 fields.get("proxy"),
                 fields.get("timezone"),
                 fields.get("locale"),
-                fields.get("platform", "windows"),
+                fields.get("platform") or host_platform(),
                 fields.get("user_agent"),
                 fields.get("screen_width", 1920),
                 fields.get("screen_height", 1080),
@@ -182,6 +198,10 @@ def update_profile(profile_id: str, **fields: Any) -> dict[str, Any] | None:
     # Pre-serialize launch_args to JSON before the generic update loop
     if "launch_args" in fields:
         fields["launch_args"] = json.dumps(fields["launch_args"] or [])
+    # Mirror create_profile: never persist a falsy platform. Otherwise SQL NULL
+    # hits ProfileResponse.platform: str and 500s on the next GET/LIST.
+    if "platform" in fields and not fields["platform"]:
+        fields["platform"] = host_platform()
 
     for col in (
         "name", "fingerprint_seed", "proxy", "timezone", "locale", "platform",
